@@ -1,26 +1,13 @@
 package main
 
 import (
-	"log"
+	"fmt"
 
-	"github.com/cgoncalveslck/go-api-ebening/helpers"
-	"github.com/gofiber/fiber/v2"
-	"github.com/gofiber/template/pug/v2"
-	"github.com/joho/godotenv"
+	"github.com/cgoncalveslck/go-api-ebening/bot"
 )
 
-func init() {
-	if err := godotenv.Load(); err != nil {
-		log.Print("No .env file found")
-	}
-}
-
 func main() {
-	app := fiber.New(
-		fiber.Config{
-			Views: pug.New("./templates", ".html"),
-		})
-
-	helpers.SetupRoutes(app)
-	log.Fatal(app.Listen(":3000"))
+	fmt.Println("MONKE BOT🐒🤖")
+	bot.BotToken = "MTI0NzY4NjEwMDUyOTU4MjIwMw.Gb6ub3.EuclP8a9MG7ehliWSh3MBP2fhl2r4Qt33kjKXA"
+	bot.Run() // call the run function of bot/bot.go
 }
