@@ -30,96 +30,111 @@ func Run() {
 	defer discord.Close() // close session, after function termination
 
 	// keep bot running untill there is NO os interruption (ctrl + C)
-	fmt.Println("Bot running....")
+	fmt.Println("Bot is running")
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt)
 	<-c
 
 }
 
-func newMessage(discord *discordgo.Session, message *discordgo.MessageCreate) {
-	if message.Author.ID == discord.State.User.ID {
+// TODO:
+// 	use one channel for keeping the sounds and another for the commands,
+//		the first one should delete any message after relevant use
+// 	look into error handling in general
+// 	try changing switch to something else, looks ugly af
+//	look into Discord heartbeats
+//  report "errors" to the user like "you're not in a voice channel" or "sound not found
+//	"paginate" message search (each req is 100 each)m, maybe resend sound entry and delete old one to order by usage
+//  cleanup entry output, probably url is enough
+// 	look into discord ui for messages
+
+func newMessage(discord *discordgo.Session, userMessage *discordgo.MessageCreate) {
+	if userMessage.Author.ID == discord.State.User.ID {
 		return
 	}
 
 	switch {
 	// DEBUG
-	case strings.Contains(message.Content, ".status"):
-		discord.MessageReactionAdd(message.ChannelID, message.ID, "✅")
+	case strings.Contains(userMessage.Content, ".status"):
+		discord.MessageReactionAdd(userMessage.ChannelID, userMessage.ID, "✅")
 
 	// UPLOAD A SOUND
-	case len(message.Attachments) != 0:
-		fileName := message.Attachments[0].Filename
-		fileURL := message.Attachments[0].URL
-		messageID := message.ID
+	case len(userMessage.Attachments) != 0:
+		fileName := userMessage.Attachments[0].Filename
+		fileURL := userMessage.Attachments[0].URL
+		messageID := userMessage.ID
 
-		_, error := discord.ChannelMessageSend(message.ChannelID, fmt.Sprintf("new-sound-entry\nname: %s\nurl: %s\nid: %s", fileName, fileURL, messageID))
+		_, err := discord.ChannelMessageSend(userMessage.ChannelID, fmt.Sprintf("new-sound-entry\nname: %s\nurl: %s\nid: %s", fileName, fileURL, messageID))
 
-		if error != nil {
-			fmt.Println(error)
+		if err != nil {
+			panic(err)
 		}
 
 	// SEARCH FOR A SOUND - should delete this eventually, not supposed to search by hand
-	case strings.Contains(message.Content, ".find"):
-		searchTerm := strings.Split(message.Content, ".find")[1]
-		messages, err := discord.ChannelMessages(message.ChannelID, 100, "", "", "")
+	case strings.Contains(userMessage.Content, ".find"):
+		searchTerm := strings.Split(userMessage.Content, ".find")[1]
+		channelMessages, err := discord.ChannelMessages(userMessage.ChannelID, 100, "", "", "")
 
 		if err != nil {
-			fmt.Println(err)
-			return
+			panic(err)
 		}
 
-		// TODO: this is heavy, do something else
-		for _, msg := range messages {
-			if strings.Contains(msg.Content, searchTerm) && msg.ID != message.ID && strings.Contains(msg.Content, "new-sound-entry") {
-				discord.ChannelMessageSend(message.ChannelID, msg.Content)
-				return
+		soundEntryReference, err := findSound(channelMessages, searchTerm, userMessage.ID)
+		if err != nil {
+			panic(err)
+		}
+		discord.ChannelMessageSendReply(userMessage.ChannelID, "Found this", soundEntryReference)
+
+		// CONNECT TO VOICE AND PLAY SOUND
+	case strings.Contains(userMessage.Content, ".s"):
+		soundName := strings.Split(userMessage.Content, ".s")[1]
+		channelMessages, err := discord.ChannelMessages(userMessage.ChannelID, 100, "", "", "")
+
+		fmt.Println("soundName: ", soundName)
+		if err != nil {
+			panic(err)
+		}
+
+		soundEntryReference, err := findSound(channelMessages, soundName, userMessage.ID)
+		if err != nil {
+			if err.Error() == "sound not found" {
+				discord.ChannelMessageSend(userMessage.ChannelID, "sound not found")
+			} else {
+				panic(err)
 			}
 		}
 
-	// CONNECT TO VOICE AND PLAY SOUND
-	case strings.Contains(message.Content, ".s"):
-		soundName := strings.Split(message.Content, ".s")[1]
-		messages, err := discord.ChannelMessages(message.ChannelID, 100, "", "", "")
-
+		channelMessage, err := discord.ChannelMessage(userMessage.ChannelID, soundEntryReference.MessageID)
 		if err != nil {
-			// TODO: handle error properly
-			fmt.Println(err)
-			return
+			panic(err)
 		}
 
-		voice, err := discord.ChannelVoiceJoin(message.GuildID, "1118604071591493735", false, false)
+		soundURL := strings.Split(channelMessage.Content, "url: ")[1]
+		soundURL = strings.Split(soundURL, "\nid")[0]
+
+		voiceState, err := discord.State.VoiceState(userMessage.GuildID, userMessage.Author.ID)
 		if err != nil {
-			// TODO: handle error properly
-			fmt.Println(err)
-			return
+			panic(err)
 		}
-		defer voice.Close()
 
-		// TODO: this is heavy, do something else
-		for _, msg := range messages {
-			// TODO: delete every message after relevant use and keep only files and upload entries
-			if strings.Contains(msg.Content, soundName) && msg.ID != message.ID && strings.Contains(msg.Content, "new-sound-entry") {
-				soundURL := strings.Split(msg.Content, "url: ")[1]
-				soundURL = strings.Split(soundURL, "\nid")[0]
-
-				PlayAudioFile(voice, soundURL)
-				fmt.Println(soundURL)
-				return
-			}
-
+		currentChannel := voiceState.ChannelID
+		voice, err := discord.ChannelVoiceJoin(userMessage.GuildID, currentChannel, false, false)
+		if err != nil {
+			panic(err)
 		}
+
+		PlayAudioFile(voice, soundURL)
 
 	// DEBUG
-	case strings.Contains(message.Content, ".resetChannel"):
-		allMessages, error := discord.ChannelMessages(message.ChannelID, 100, "", "", "")
-		if error != nil {
-			// TODO: handle error properly
-			fmt.Println(error)
+	case strings.Contains(userMessage.Content, ".resetChannel"):
+		allMessages, err := discord.ChannelMessages(userMessage.ChannelID, 100, "", "", "")
+		if err != nil {
+			panic(err)
 		}
 
-		for _, msg := range allMessages {
-			discord.ChannelMessageDelete(message.ChannelID, msg.ID)
+		// check if i can delete more than one message at a time
+		for _, channelMessage := range allMessages {
+			discord.ChannelMessageDelete(userMessage.ChannelID, channelMessage.ID)
 		}
 	}
 
@@ -159,10 +174,23 @@ func PlayAudioFile(v *discordgo.VoiceConnection, path string) {
 			encodeSession.Cleanup()
 			return
 		case <-ticker.C:
-			stats := encodeSession.Stats()
 			playbackPosition := stream.PlaybackPosition()
-
-			fmt.Printf("Playback: %10s, Transcode Stats: Time: %5s, Size: %5dkB, Bitrate: %6.2fkB, Speed: %5.1fx\r", playbackPosition, stats.Duration.String(), stats.Size, stats.Bitrate, stats.Speed)
+			fmt.Printf("Playback: %10s, \r\n", playbackPosition)
 		}
 	}
+}
+
+// search for sound in channel messages
+func findSound(channelMessages []*discordgo.Message, searchTerm string, messageID string) (*discordgo.MessageReference, error) {
+	for _, channelMessage := range channelMessages {
+		if CheckMessageForSoundEntry(channelMessage, searchTerm, messageID) {
+			return channelMessage.Reference(), nil
+		}
+	}
+	return nil, fmt.Errorf("sound not found")
+}
+
+// check if is a sound entry, search name, check it isn't the caller
+func CheckMessageForSoundEntry(message *discordgo.Message, soundName string, messageID string) bool {
+	return strings.Contains(message.Content, soundName) && message.ID != messageID && strings.Contains(message.Content, "new-sound-entry")
 }
