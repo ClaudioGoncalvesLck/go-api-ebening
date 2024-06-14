@@ -62,6 +62,7 @@ const (
 
 func Run() {
 	discord, err := discordgo.New("Bot " + BotToken)
+	fmt.Println("Created discord session")
 	if err != nil {
 		panic(err)
 	}
@@ -75,10 +76,16 @@ func Run() {
 	}
 
 	discord.AddHandler(voiceStateUpdate)
+	fmt.Println("Added voice state update handler")
 	discord.AddHandler(newMessage)
+	fmt.Println("Added new message handler")
 
 	// open session
-	discord.Open()
+	err = discord.Open()
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println("Opened discord session")
 	defer discord.Close() // close session, after function termination
 
 	// keep bot running untill there is NO os interruption (ctrl + C)
