@@ -22,8 +22,18 @@ var BotToken string
 
 var State BotState
 
+type SoundName string
+
+// SoundName as key bc that's what we're using for lookup
+type SoundList map[SoundName]Sound
+
+type Sound struct {
+	MessageID string
+	URL       string
+}
+
 type BotState struct {
-	SoundList        map[string]string
+	SoundList        SoundList
 	VoiceChannels    VoiceChannels
 	VoiceConnections []*discordgo.VoiceConnection
 }
@@ -69,7 +79,7 @@ func Run() {
 
 	State = BotState{
 		// i dont think i need to do this
-		SoundList: make(map[string]string),
+		SoundList: make(map[SoundName]Sound),
 		VoiceChannels: VoiceChannels{
 			Channels: []VoiceChannel{},
 		},
@@ -168,47 +178,28 @@ func PlayAudioFile(v *discordgo.VoiceConnection, path string) {
 	}
 }
 
-func findSoundRecursive(d *discordgo.Session, userMessage *discordgo.MessageCreate, searchTerm, beforeID string) (*discordgo.Message, error) {
-	soundsChannel := getSoundsChannelID(d, userMessage)
-	channelMessages, err := d.ChannelMessages(soundsChannel, 100, beforeID, "", "")
+func tryConnectingToVoice(d *discordgo.Session, guildID string, userID string, channelID string) (*discordgo.VoiceConnection, error) {
+	if userID == "" && channelID == "" {
+		return nil, errors.New("specify either userID or channelID")
+	}
+
+	if channelID == "" {
+		voiceState, err := d.State.VoiceState(guildID, userID)
+		if err != nil {
+			if err.Error() != "state cache not found" {
+				return nil, err
+			} else {
+				return nil, nil
+			}
+		}
+		channelID = voiceState.ChannelID
+	}
+
+	voice, err := d.ChannelVoiceJoin(guildID, channelID, false, false)
 	if err != nil {
 		return nil, err
 	}
 
-	for _, channelMessage := range channelMessages {
-		if len(channelMessage.Attachments) == 0 {
-			continue
-		}
-		if strings.Split(channelMessage.Attachments[0].Filename, ".")[0] == searchTerm {
-			return channelMessage, nil
-		}
-	}
-
-	// if length < 100, this is the last batch and checked all of them
-	if len(channelMessages) < 100 {
-		return nil, errors.New("sound not found")
-	}
-
-	lastMessageID := channelMessages[len(channelMessages)-1].ID
-	return findSoundRecursive(d, userMessage, searchTerm, lastMessageID)
-}
-
-func tryConnectingToVoice(d *discordgo.Session, userMessage *discordgo.MessageCreate) (*discordgo.VoiceConnection, error) {
-	voiceState, err := d.State.VoiceState(userMessage.GuildID, userMessage.Author.ID)
-	if err != nil {
-		if err.Error() != "state cache not found" {
-			return nil, err
-		} else {
-			return nil, nil
-		}
-	}
-
-	voice, err := d.ChannelVoiceJoin(userMessage.GuildID, voiceState.ChannelID, false, false)
-	if err != nil {
-		return nil, err
-	}
-
-	State.VoiceConnections = append(State.VoiceConnections, voice)
 	return voice, nil
 }
 
@@ -275,38 +266,51 @@ func handleCommandsChannel(discord *discordgo.Session, userMessage *discordgo.Me
 		discord.ChannelMessageSend(userMessage.ChannelID, formattedMessage)
 
 	case command == string(Connect):
-		_, err := tryConnectingToVoice(discord, userMessage)
+		_, err := tryConnectingToVoice(discord, userMessage.GuildID, userMessage.Author.ID, "")
 		if err != nil {
 			panic(err)
 		}
 
 	case command == string(PlaySound):
 		searchTerm := strings.Split(userMessage.Content, " ")[1]
-		soundEntryMessage, err := findSoundRecursive(discord, userMessage, searchTerm, "")
-		if err != nil {
-			if err.Error() == "sound not found" {
-				discord.ChannelMessageSend(userMessage.ChannelID, "sound not found")
+
+		//lookup sound locally
+		sound, ok := State.SoundList[SoundName(searchTerm)]
+		if !ok {
+			// if not found, map all sounds from discord to state
+			err := getSoundsRecursive(discord, userMessage, "")
+			if err != nil {
+				if err.Error() == "sounds channel not found" {
+					discord.ChannelMessageSend(userMessage.ChannelID, "Sounds channel not found")
+					return
+				} else {
+					panic(err)
+				}
+			}
+
+			// try to find the sound again
+			sound, ok = State.SoundList[SoundName(searchTerm)]
+			if !ok {
+				// it doesn't exist locally or on discord
+				discord.ChannelMessageSend(userMessage.ChannelID, "Sound not found")
 				return
-			} else {
-				panic(err)
 			}
 		}
+		// here sound should have been found
 
-		soundURL := soundEntryMessage.Attachments[0].URL
-		voice, err := tryConnectingToVoice(discord, userMessage)
+		voice, err := tryConnectingToVoice(discord, userMessage.GuildID, userMessage.Author.ID, "")
 		if err != nil {
+			fmt.Println("Error connecting to voice channel:", err)
 			panic(err)
 		}
 		if voice == nil {
 			discord.ChannelMessageSend(userMessage.ChannelID, "You need to be in a voice channel")
 			return
 		}
-		go PlaybackManager(voice)
 
-		if command == string(PlaySound) {
-			QueuePlayback(voice, soundURL)
-			return
-		}
+		// this probably shouldn't be here
+		go PlaybackManager(voice)
+		QueuePlayback(voice, sound.URL)
 
 	case command == string(List):
 		if len(State.SoundList) == 0 {
@@ -317,10 +321,11 @@ func handleCommandsChannel(discord *discordgo.Session, userMessage *discordgo.Me
 		}
 
 		// shoutout rasmussy
-		listOutput := "```Available sounds :\n------------------\n\n"
+		listOutput := "```(" + fmt.Sprint(len(State.SoundList)) + ") " + "Available sounds :\n------------------\n\n"
 		nb := 0
-		for _, soundName := range State.SoundList {
+		for name := range State.SoundList {
 			nb += 1
+			var soundName = string(name)
 			for len(soundName) < 15 {
 				soundName += " "
 			}
@@ -403,7 +408,11 @@ func getSoundsRecursive(d *discordgo.Session, userMessage *discordgo.MessageCrea
 	}
 
 	for _, channelMessage := range channelMessages {
-		State.SoundList[channelMessage.ID] = strings.Split(channelMessage.Attachments[0].Filename, ".")[0]
+		trimmedName := strings.TrimSuffix(channelMessage.Attachments[0].Filename, ".mp3")
+		State.SoundList[SoundName(trimmedName)] = Sound{
+			MessageID: channelMessage.ID,
+			URL:       channelMessage.Attachments[0].URL,
+		}
 	}
 
 	// if length < 100, this is the last batch and checked all of them
@@ -495,79 +504,50 @@ func getUsersInVC(d *discordgo.Session, guildID string) VoiceChannels {
 func voiceStateUpdate(d *discordgo.Session, v *discordgo.VoiceStateUpdate) {
 	// if there is no voice state, build it
 	if v.Member.User.Bot {
+		// idk if i need to do this
+		// if v.BeforeUpdate != nil && v.ChannelID == "" {
+		// 	fmt.Println("Bot left voice channel")
+		// 	vc, ok := d.VoiceConnections[v.GuildID]
+		// 	if ok {
+		// 		vc.Disconnect()
+		// 	}
+		// }
 		return
-	}
-	if len(State.VoiceChannels.Channels) == 0 {
-		getUsersInVC(d, v.GuildID)
 	} else {
-		// if there is, update it with whatever happened
-		if v.BeforeUpdate == nil {
-			fmt.Println("User joined voice channel")
-			voiceChannelStateUpdate(d, v.UserID, v.ChannelID)
+		if len(State.VoiceChannels.Channels) == 0 {
+			getUsersInVC(d, v.GuildID)
 		} else {
-			if v.ChannelID != "" && v.BeforeUpdate != nil {
-				fmt.Println("User switched voice channels")
+			// if there is, update it with whatever happened
+			if v.BeforeUpdate == nil {
+				fmt.Println("User joined voice channel")
 				voiceChannelStateUpdate(d, v.UserID, v.ChannelID)
 			} else {
-				fmt.Println("User left voice channel")
-				voiceChannelStateUpdate(d, v.UserID, "")
-			}
-		}
-	}
-
-	var usersInVC []string
-	for _, vc := range State.VoiceChannels.Channels {
-		for _, user := range vc.UsersConnected {
-			usersInVC = append(usersInVC, user.Username)
-		}
-
-	}
-
-	if len(usersInVC) == 0 {
-		voiceConnections := State.VoiceConnections
-		for _, vc := range voiceConnections {
-			if vc.GuildID == v.GuildID {
-				vc.Disconnect()
-				for idx, vc := range State.VoiceConnections {
-					if vc.ChannelID == v.ChannelID {
-						State.VoiceConnections = append(State.VoiceConnections[:idx], State.VoiceConnections[idx+1:]...)
-					}
+				if v.ChannelID != "" && v.BeforeUpdate != nil {
+					fmt.Println("User switched voice channels")
+					voiceChannelStateUpdate(d, v.UserID, v.ChannelID)
+				} else {
+					fmt.Println("User left voice channel")
+					voiceChannelStateUpdate(d, v.UserID, "")
 				}
 			}
 		}
 	}
 
-	if len(usersInVC) == 1 {
-		//	find channel with the user that connected and join it
-		for _, vc := range State.VoiceChannels.Channels {
-			for _, user := range vc.UsersConnected {
-				if user.Username == usersInVC[0] {
-					// abstract this to the tryConnectingToVoice function
-					voice, err := d.ChannelVoiceJoin(v.GuildID, vc.ID, false, false)
-					if err != nil {
-						fmt.Println("Error joining voice channel:", err)
-						return
-					}
-					State.VoiceConnections = append(State.VoiceConnections, voice)
-				}
-			}
-		}
-	}
 }
 
 func voiceChannelStateUpdate(d *discordgo.Session, userID string, channelID string) {
 	// remove user from old channel
 	for idx, vc := range State.VoiceChannels.Channels {
+		var f bool
 		for i, user := range vc.UsersConnected {
-			var f bool
 			if user.ID == userID {
 				State.VoiceChannels.Channels[idx].UsersConnected = append(vc.UsersConnected[:i], vc.UsersConnected[i+1:]...)
 				f = true
 				break
 			}
-			if f { // ooga booga code
-				break
-			}
+		}
+		if f { // ooga booga code
+			break
 		}
 	}
 
