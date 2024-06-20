@@ -86,7 +86,7 @@ func Run() {
 	}
 
 	// add ready handler here to loads sounds to memory
-	// use .list for now
+	// for now use .list or force load on command
 
 	discord.AddHandler(voiceStateUpdate)
 	discord.AddHandler(newMessage)
@@ -110,7 +110,6 @@ func Run() {
 // 	look into discord ui for messages (commands and message components)
 //  	https://discord.com/developers/docs/interactions/overview
 // 	try improving zip upload
-// 	implement renaming and deleting sounds
 // 	implement setting a volume (maybe command gets a sound, bot reuploads with message like v:0-100)
 // 	implement entrances
 
@@ -282,9 +281,16 @@ func handleCommandsChannel(discord *discordgo.Session, userMessage *discordgo.Me
 			return
 		}
 
+		// DEV DEBUG
+		if len(State.SoundList) == 0 {
+			err := getSoundsRecursive(discord, userMessage.GuildID, "")
+			if err != nil {
+				panic(err)
+			}
+		}
+
 		//lookup sound locally only, upload or bootup should assure it's either here or nowhere
 		searchTerm := strings.Split(userMessage.Content, " ")[1]
-
 		sound, ok := State.SoundList[SoundName(searchTerm)]
 		if !ok {
 			discord.ChannelMessageSend(userMessage.ChannelID, "Sound not found")
@@ -317,7 +323,7 @@ func handleCommandsChannel(discord *discordgo.Session, userMessage *discordgo.Me
 				listOutput += "\n"
 			}
 			// Discord max message length is 2000
-			if nb%42 == 0 || len(listOutput) > 1900 {
+			if len(listOutput) > 1950 {
 				listOutput += "```"
 				discord.ChannelMessageSend(userMessage.ChannelID, listOutput)
 				listOutput = "```"
@@ -326,6 +332,43 @@ func handleCommandsChannel(discord *discordgo.Session, userMessage *discordgo.Me
 		listOutput += "```"
 		if listOutput != "``````" {
 			discord.ChannelMessageSend(userMessage.ChannelID, listOutput)
+		}
+
+	case command == ".rename":
+		// find file by name, upload it with new name, delete old file
+		searchTerm := strings.Split(userMessage.Content, " ")[1]
+		sound, ok := State.SoundList[SoundName(searchTerm)]
+		if !ok {
+			discord.ChannelMessageSend(userMessage.ChannelID, "Sound not found")
+			return
+		}
+
+		soundsChannel := getSoundsChannelID(discord, userMessage.GuildID)
+		_, err := discord.ChannelMessage(soundsChannel, sound.MessageID)
+		if err != nil {
+			panic(err)
+		}
+
+		discord.ChannelMessageDelete(soundsChannel, sound.MessageID)
+
+		// upload new message
+		req, err := http.Get(sound.URL)
+		if err != nil {
+			panic(err)
+		}
+		defer req.Body.Close()
+
+		message, err := discord.ChannelFileSend(soundsChannel, strings.Split(userMessage.Content, " ")[2]+".mp3", req.Body)
+		if err != nil {
+			panic(err)
+		}
+
+		discord.ChannelMessageSendReply(userMessage.ChannelID, "Sound renamed", userMessage.Reference())
+
+		// abstract this maybe
+		State.SoundList[SoundName(strings.Split(userMessage.Content, " ")[2])] = Sound{
+			MessageID: message.ID,
+			URL:       sound.URL,
 		}
 	}
 }
