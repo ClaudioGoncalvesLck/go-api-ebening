@@ -85,17 +85,17 @@ func Run() {
 		},
 	}
 
+	// add ready handler here to loads sounds to memory
+	// use .list for now
+
 	discord.AddHandler(voiceStateUpdate)
-	fmt.Println("Added voice state update handler")
 	discord.AddHandler(newMessage)
-	fmt.Println("Added new message handler")
 
 	// open session
 	err = discord.Open()
 	if err != nil {
 		panic(err)
 	}
-	fmt.Println("Opened discord session")
 	defer discord.Close() // close session, after function termination
 
 	// keep bot running untill there is NO os interruption (ctrl + C)
@@ -134,7 +134,7 @@ func newMessage(discord *discordgo.Session, userMessage *discordgo.MessageCreate
 
 }
 
-// sample from github.com/jonas747/dca
+// modified sample from github.com/jonas747/dca
 func PlayAudioFile(v *discordgo.VoiceConnection, path string) {
 	playbackMutex.Lock()
 	defer playbackMutex.Unlock()
@@ -272,32 +272,6 @@ func handleCommandsChannel(discord *discordgo.Session, userMessage *discordgo.Me
 		}
 
 	case command == string(PlaySound):
-		searchTerm := strings.Split(userMessage.Content, " ")[1]
-
-		//lookup sound locally
-		sound, ok := State.SoundList[SoundName(searchTerm)]
-		if !ok {
-			// if not found, map all sounds from discord to state
-			err := getSoundsRecursive(discord, userMessage, "")
-			if err != nil {
-				if err.Error() == "sounds channel not found" {
-					discord.ChannelMessageSend(userMessage.ChannelID, "Sounds channel not found")
-					return
-				} else {
-					panic(err)
-				}
-			}
-
-			// try to find the sound again
-			sound, ok = State.SoundList[SoundName(searchTerm)]
-			if !ok {
-				// it doesn't exist locally or on discord
-				discord.ChannelMessageSend(userMessage.ChannelID, "Sound not found")
-				return
-			}
-		}
-		// here sound should have been found
-
 		voice, err := tryConnectingToVoice(discord, userMessage.GuildID, userMessage.Author.ID, "")
 		if err != nil {
 			fmt.Println("Error connecting to voice channel:", err)
@@ -308,13 +282,22 @@ func handleCommandsChannel(discord *discordgo.Session, userMessage *discordgo.Me
 			return
 		}
 
+		//lookup sound locally only, upload or bootup should assure it's either here or nowhere
+		searchTerm := strings.Split(userMessage.Content, " ")[1]
+
+		sound, ok := State.SoundList[SoundName(searchTerm)]
+		if !ok {
+			discord.ChannelMessageSend(userMessage.ChannelID, "Sound not found")
+			return
+		}
+
 		// this probably shouldn't be here
 		go PlaybackManager(voice)
 		QueuePlayback(voice, sound.URL)
 
 	case command == string(List):
 		if len(State.SoundList) == 0 {
-			err := getSoundsRecursive(discord, userMessage, "")
+			err := getSoundsRecursive(discord, userMessage.GuildID, "")
 			if err != nil {
 				panic(err)
 			}
@@ -397,8 +380,9 @@ func handleZipUpload(d *discordgo.Session, userMessage *discordgo.MessageCreate,
 	d.ChannelMessageDelete(userMessage.ChannelID, userMessage.ID)
 }
 
-func getSoundsRecursive(d *discordgo.Session, userMessage *discordgo.MessageCreate, beforeID string) error {
-	soundsChannelID := getSoundsChannelID(d, userMessage)
+// discord rate limit's at around 4/5 quick requests and this does 1 per 100 sounds (4 at the current 390 sounds)
+func getSoundsRecursive(d *discordgo.Session, guildID string, beforeID string) error {
+	soundsChannelID := getSoundsChannelID(d, guildID)
 	if soundsChannelID == "" {
 		return errors.New("sounds channel not found")
 	}
@@ -421,11 +405,11 @@ func getSoundsRecursive(d *discordgo.Session, userMessage *discordgo.MessageCrea
 	}
 
 	lastMessageID := channelMessages[len(channelMessages)-1].ID
-	return getSoundsRecursive(d, userMessage, lastMessageID)
+	return getSoundsRecursive(d, guildID, lastMessageID)
 }
 
-func getSoundsChannelID(d *discordgo.Session, userMessage *discordgo.MessageCreate) string {
-	channels, err := d.GuildChannels(userMessage.GuildID)
+func getSoundsChannelID(d *discordgo.Session, guildID string) string {
+	channels, err := d.GuildChannels(guildID)
 	if err != nil {
 		panic(err)
 	}
@@ -504,31 +488,23 @@ func getUsersInVC(d *discordgo.Session, guildID string) VoiceChannels {
 func voiceStateUpdate(d *discordgo.Session, v *discordgo.VoiceStateUpdate) {
 	// if there is no voice state, build it
 	if v.Member.User.Bot {
-		// idk if i need to do this
-		// if v.BeforeUpdate != nil && v.ChannelID == "" {
-		// 	fmt.Println("Bot left voice channel")
-		// 	vc, ok := d.VoiceConnections[v.GuildID]
-		// 	if ok {
-		// 		vc.Disconnect()
-		// 	}
-		// }
 		return
+	}
+
+	if len(State.VoiceChannels.Channels) == 0 {
+		getUsersInVC(d, v.GuildID)
 	} else {
-		if len(State.VoiceChannels.Channels) == 0 {
-			getUsersInVC(d, v.GuildID)
+		// if there is, update it with whatever happened
+		if v.BeforeUpdate == nil {
+			fmt.Println("User joined voice channel")
+			voiceChannelStateUpdate(d, v.UserID, v.ChannelID)
 		} else {
-			// if there is, update it with whatever happened
-			if v.BeforeUpdate == nil {
-				fmt.Println("User joined voice channel")
+			if v.ChannelID != "" && v.BeforeUpdate != nil {
+				fmt.Println("User switched voice channels")
 				voiceChannelStateUpdate(d, v.UserID, v.ChannelID)
 			} else {
-				if v.ChannelID != "" && v.BeforeUpdate != nil {
-					fmt.Println("User switched voice channels")
-					voiceChannelStateUpdate(d, v.UserID, v.ChannelID)
-				} else {
-					fmt.Println("User left voice channel")
-					voiceChannelStateUpdate(d, v.UserID, "")
-				}
+				fmt.Println("User left voice channel")
+				voiceChannelStateUpdate(d, v.UserID, "")
 			}
 		}
 	}
