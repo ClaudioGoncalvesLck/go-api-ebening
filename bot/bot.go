@@ -23,17 +23,20 @@ var BotToken string
 var State BotState
 
 type SoundName string
+type UserID string
 
 // SoundName as key bc that's what we're using for lookup
-type SoundList map[SoundName]Sound
+type SoundList map[SoundName]*Sound
 
 type Sound struct {
 	MessageID string
 	URL       string
+	Volume    string // dca uses 0-256 for some reason, try mapping it to 0-100 for better UX
 }
 
 type BotState struct {
 	SoundList        SoundList
+	Entrances        map[UserID]*Sound
 	VoiceChannels    VoiceChannels
 	VoiceConnections []*discordgo.VoiceConnection
 }
@@ -79,7 +82,8 @@ func Run() {
 
 	State = BotState{
 		// i dont think i need to do this
-		SoundList: make(map[SoundName]Sound),
+		SoundList: make(map[SoundName]*Sound),
+		Entrances: make(map[UserID]*Sound),
 		VoiceChannels: VoiceChannels{
 			Channels: []VoiceChannel{},
 		},
@@ -96,7 +100,7 @@ func Run() {
 	if err != nil {
 		panic(err)
 	}
-	defer discord.Close() // close session, after function termination
+	defer discord.Close()
 
 	// keep bot running untill there is NO os interruption (ctrl + C)
 	fmt.Println("Bot is running")
@@ -106,12 +110,16 @@ func Run() {
 }
 
 // TODO:
-// 	look into error handling in general
+// 	look into error handling in general (remove panics and handle gracefully)
 // 	look into discord ui for messages (commands and message components)
 //  	https://discord.com/developers/docs/interactions/overview
 // 	try improving zip upload
 // 	implement setting a volume (maybe command gets a sound, bot reuploads with message like v:0-100)
-// 	implement entrances
+// 	implement removing entrances
+//  cache entrances and volumes too (assert only 1 entrace per user)
+//  keep .help up to date
+// 	add sound to state on upload
+// 	maybe let commands be used in sounds channel but still delete them
 
 func newMessage(discord *discordgo.Session, userMessage *discordgo.MessageCreate) {
 	if userMessage.Author.Bot {
@@ -121,6 +129,14 @@ func newMessage(discord *discordgo.Session, userMessage *discordgo.MessageCreate
 	channel, err := discord.Channel(userMessage.ChannelID)
 	if err != nil {
 		panic(err)
+	}
+
+	// DEV DEBUG
+	if len(State.SoundList) == 0 {
+		err := getSoundsRecursive(discord, userMessage.GuildID, "")
+		if err != nil {
+			panic(err)
+		}
 	}
 
 	if channel.Name == string(SoundsChannel) {
@@ -145,7 +161,7 @@ func PlayAudioFile(v *discordgo.VoiceConnection, path string) {
 
 	opts := dca.StdEncodeOptions
 	opts.RawOutput = true
-	opts.Bitrate = 128
+	opts.Bitrate = 32
 
 	encodeSession, err := dca.EncodeFile(path, opts)
 	if err != nil {
@@ -281,14 +297,6 @@ func handleCommandsChannel(discord *discordgo.Session, userMessage *discordgo.Me
 			return
 		}
 
-		// DEV DEBUG
-		if len(State.SoundList) == 0 {
-			err := getSoundsRecursive(discord, userMessage.GuildID, "")
-			if err != nil {
-				panic(err)
-			}
-		}
-
 		//lookup sound locally only, upload or bootup should assure it's either here or nowhere
 		searchTerm := strings.Split(userMessage.Content, " ")[1]
 		sound, ok := State.SoundList[SoundName(searchTerm)]
@@ -323,7 +331,7 @@ func handleCommandsChannel(discord *discordgo.Session, userMessage *discordgo.Me
 				listOutput += "\n"
 			}
 			// Discord max message length is 2000
-			if len(listOutput) > 1950 {
+			if len(listOutput) > 1950 { // removed condition for max sounds printed
 				listOutput += "```"
 				discord.ChannelMessageSend(userMessage.ChannelID, listOutput)
 				listOutput = "```"
@@ -337,6 +345,7 @@ func handleCommandsChannel(discord *discordgo.Session, userMessage *discordgo.Me
 	case command == ".rename":
 		// find file by name, upload it with new name, delete old file
 		searchTerm := strings.Split(userMessage.Content, " ")[1]
+		newName := strings.Split(userMessage.Content, " ")[2]
 		sound, ok := State.SoundList[SoundName(searchTerm)]
 		if !ok {
 			discord.ChannelMessageSend(userMessage.ChannelID, "Sound not found")
@@ -351,25 +360,85 @@ func handleCommandsChannel(discord *discordgo.Session, userMessage *discordgo.Me
 
 		discord.ChannelMessageDelete(soundsChannel, sound.MessageID)
 
-		// upload new message
 		req, err := http.Get(sound.URL)
 		if err != nil {
 			panic(err)
 		}
 		defer req.Body.Close()
 
-		message, err := discord.ChannelFileSend(soundsChannel, strings.Split(userMessage.Content, " ")[2]+".mp3", req.Body)
+		message, err := discord.ChannelFileSend(soundsChannel, newName+".mp3", req.Body)
 		if err != nil {
 			panic(err)
 		}
 
+		// this is ugly af, check if there's a better way to do this
+		sound.MessageID = message.ID
+		State.SoundList[SoundName(newName)] = sound
+		delete(State.SoundList, SoundName(searchTerm))
+
 		discord.ChannelMessageSendReply(userMessage.ChannelID, "Sound renamed", userMessage.Reference())
 
-		// abstract this maybe
-		State.SoundList[SoundName(strings.Split(userMessage.Content, " ")[2])] = Sound{
-			MessageID: message.ID,
-			URL:       sound.URL,
+	case command == ".addentrance":
+		searchTerm := strings.Split(userMessage.Content, " ")[1]
+		sound, ok := State.SoundList[SoundName(searchTerm)]
+		if !ok {
+			discord.ChannelMessageSend(userMessage.ChannelID, "Sound not found")
+			return
 		}
+
+		soundsChannel := getSoundsChannelID(discord, userMessage.GuildID)
+		soundMessage, err := discord.ChannelMessage(soundsChannel, sound.MessageID)
+		if err != nil {
+			panic(err)
+		}
+
+		if !soundMessage.Author.Bot {
+			req, err := http.Get(sound.URL)
+			if err != nil {
+				panic(err)
+			}
+			defer req.Body.Close()
+
+			soundMessage, err = discord.ChannelFileSend(soundsChannel, searchTerm+".mp3", req.Body)
+			if err != nil {
+				panic(err)
+			}
+
+			discord.ChannelMessageDelete(soundsChannel, sound.MessageID)
+			State.SoundList[SoundName(searchTerm)] = &Sound{
+				MessageID: soundMessage.ID,
+				URL:       sound.URL,
+				Volume:    sound.Volume,
+			}
+		}
+
+		// right now a message tag can look like "e:userID;v:0-100;e:userID;"
+		// where e: says that sound is an entrance to that user and v: is the volume for that sound
+		if soundMessage.Content != "" {
+			messageTags := strings.Split(soundMessage.Content, ";")
+			if len(messageTags) > 0 {
+				for _, tag := range messageTags {
+					typeValue := strings.Split(tag, ":")
+					tagType, tagValue := typeValue[0], typeValue[1]
+
+					if tagType == "e" {
+						if tagValue == userMessage.Author.ID {
+							discord.ChannelMessageSend(userMessage.ChannelID, "This is already your entrance")
+							return
+						}
+					}
+				}
+
+			}
+		}
+
+		soundMessage.Content += " e:" + userMessage.Author.ID + ";"
+		_, err = discord.ChannelMessageEdit(soundsChannel, soundMessage.ID, soundMessage.Content)
+		if err != nil {
+			panic(err)
+		}
+
+		State.Entrances[UserID(userMessage.Author.ID)] = sound
 	}
 }
 
@@ -436,10 +505,37 @@ func getSoundsRecursive(d *discordgo.Session, guildID string, beforeID string) e
 
 	for _, channelMessage := range channelMessages {
 		trimmedName := strings.TrimSuffix(channelMessage.Attachments[0].Filename, ".mp3")
-		State.SoundList[SoundName(trimmedName)] = Sound{
+
+		sound := &Sound{
 			MessageID: channelMessage.ID,
 			URL:       channelMessage.Attachments[0].URL,
 		}
+
+		if channelMessage.Content != "" {
+			messageTags := strings.Split(channelMessage.Content, ";")
+
+			for _, tag := range messageTags {
+				if tag == "" {
+					continue
+				}
+
+				tag := strings.Split(tag, ":")
+				tagType, tagValue := tag[0], tag[1]
+
+				if tagType == "e" {
+					// tagValue is the user ID
+					State.Entrances[UserID(tagValue)] = sound
+				}
+
+				if tagType == "v" {
+					// tagValue is the volume
+					sound.Volume = tagValue
+				}
+			}
+
+		}
+
+		State.SoundList[SoundName(trimmedName)] = sound
 	}
 
 	// if length < 100, this is the last batch and checked all of them
@@ -529,48 +625,45 @@ func getUsersInVC(d *discordgo.Session, guildID string) VoiceChannels {
 }
 
 func voiceStateUpdate(d *discordgo.Session, v *discordgo.VoiceStateUpdate) {
-	// if there is no voice state, build it
-	if v.Member.User.Bot {
-		return
-	}
 
 	if len(State.VoiceChannels.Channels) == 0 {
 		getUsersInVC(d, v.GuildID)
 	} else {
-		// if there is, update it with whatever happened
-		if v.BeforeUpdate == nil {
-			fmt.Println("User joined voice channel")
-			voiceChannelStateUpdate(d, v.UserID, v.ChannelID)
-		} else {
-			if v.ChannelID != "" && v.BeforeUpdate != nil {
-				fmt.Println("User switched voice channels")
-				voiceChannelStateUpdate(d, v.UserID, v.ChannelID)
-			} else {
-				fmt.Println("User left voice channel")
-				voiceChannelStateUpdate(d, v.UserID, "")
+		voiceChannelStateUpdate(d, v.UserID, v.ChannelID)
+
+		// plays entrance if user joins a voice channel, doesn't on switch
+		if v.ChannelID != "" && v.BeforeUpdate == nil {
+			userEntrance, ok := State.Entrances[UserID(v.UserID)]
+			if ok {
+				voice, err := tryConnectingToVoice(d, v.GuildID, v.UserID, v.ChannelID)
+				if err != nil {
+					panic(err)
+				}
+
+				if voice == nil {
+					return
+				}
+
+				go PlaybackManager(voice)
+				QueuePlayback(voice, userEntrance.URL)
 			}
 		}
+
 	}
 
 }
 
 func voiceChannelStateUpdate(d *discordgo.Session, userID string, channelID string) {
-	// remove user from old channel
+loop:
 	for idx, vc := range State.VoiceChannels.Channels {
-		var f bool
 		for i, user := range vc.UsersConnected {
 			if user.ID == userID {
 				State.VoiceChannels.Channels[idx].UsersConnected = append(vc.UsersConnected[:i], vc.UsersConnected[i+1:]...)
-				f = true
-				break
+				break loop
 			}
-		}
-		if f { // ooga booga code
-			break
 		}
 	}
 
-	// add user to new channel if he went to one
 	if channelID != "" {
 		for idx, vc := range State.VoiceChannels.Channels {
 			if vc.ID == channelID {
@@ -580,7 +673,7 @@ func voiceChannelStateUpdate(d *discordgo.Session, userID string, channelID stri
 					return
 				}
 				State.VoiceChannels.Channels[idx].UsersConnected = append(vc.UsersConnected, *user)
-				return // Assuming the channelID is unique and found
+				return
 			}
 		}
 	}
