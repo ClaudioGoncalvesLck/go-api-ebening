@@ -279,14 +279,14 @@ func handleCommandsChannel(discord *discordgo.Session, userMessage *discordgo.Me
 		formattedMessage :=
 			"### To add sounds, just send them to the 'sounds' channel as a message (just the file, no text)\n" +
 				"**Commands:**\n" +
-				"`.s <sound-name>` Plays a sound\n" +
-				"`.c` Connects to the voice channel you are in.\n" +
-				"`.list` Lists all sounds in the sounds channel.\n" +
-				"`.ss` Stops the current sound.\n" +
-				"`.rename <current-name> <new-name>` Renames a sound.\n" +
-				"`.addentrance <sound-name>` Sets a sound as your entrance sound.\n" +
-				"`.adjustvol <sound-name> <volume>` Adjusts the volume of a sound (0-512)." +
-				"`.f <sound-name>` Finds a sound by name and returns a link to it."
+				"`,s <sound-name>` Plays a sound\n" +
+				"`,c` Connects to the voice channel you are in.\n" +
+				"`,list` Lists all sounds in the sounds channel.\n" +
+				"`,ss` Stops the current sound.\n" +
+				"`,rename <current-name> <new-name>` Renames a sound.\n" +
+				"`,addentrance <sound-name>` Sets a sound as your entrance sound.\n" +
+				"`,adjustvol <sound-name> <volume>` Adjusts the volume of a sound (0-512).\n" +
+				"`,f <sound-name>` Finds a sound by name and returns a link to it."
 
 		discord.ChannelMessageSend(userMessage.ChannelID, formattedMessage)
 
@@ -665,41 +665,47 @@ func getSoundsRecursive(d *discordgo.Session, guildID string, beforeID string) e
 
 	fmt.Println("Loaded", len(channelMessages), "sounds")
 	for _, channelMessage := range channelMessages {
-		trimmedName := strings.TrimSuffix(channelMessage.Attachments[0].Filename, ".mp3")
+		if len(channelMessage.Attachments) > 0 {
+			fileName := channelMessage.Attachments[0].Filename
+			if strings.Split(fileName, ".")[1] != "mp3" {
+				continue
+			}
+			trimmedName := strings.TrimSuffix(fileName, ".mp3")
 
-		sound := &Sound{
-			MessageID: channelMessage.ID,
-			URL:       channelMessage.Attachments[0].URL,
-		}
+			sound := &Sound{
+				MessageID: channelMessage.ID,
+				URL:       channelMessage.Attachments[0].URL,
+			}
 
-		if channelMessage.Content != "" {
-			messageTags := strings.Split(channelMessage.Content, ";")
+			if channelMessage.Content != "" {
+				messageTags := strings.Split(channelMessage.Content, ";")
 
-			for _, tag := range messageTags {
-				if tag == "" {
-					continue
-				}
-
-				tag := strings.Split(tag, ":")
-				tagType, tagValue := tag[0], tag[1]
-
-				if tagType == "e" {
-					// tagValue is the user ID
-					State.Entrances[UserID(tagValue)] = sound
-				}
-
-				if tagType == "v" {
-					// tagValue is the volume
-					volInt, err := strconv.ParseInt(tagValue, 10, 64)
-					if err != nil {
-						panic(err)
+				for _, tag := range messageTags {
+					if tag == "" {
+						continue
 					}
-					sound.Volume = int(volInt)
+
+					tag := strings.Split(tag, ":")
+					tagType, tagValue := tag[0], tag[1]
+
+					if tagType == "e" {
+						// tagValue is the user ID
+						State.Entrances[UserID(tagValue)] = sound
+					}
+
+					if tagType == "v" {
+						// tagValue is the volume
+						volInt, err := strconv.ParseInt(tagValue, 10, 64)
+						if err != nil {
+							panic(err)
+						}
+						sound.Volume = int(volInt)
+					}
 				}
 			}
-		}
 
-		State.SoundList[SoundName(trimmedName)] = sound
+			State.SoundList[SoundName(trimmedName)] = sound
+		}
 	}
 
 	// if length < 100, this is the last batch and checked all of them
