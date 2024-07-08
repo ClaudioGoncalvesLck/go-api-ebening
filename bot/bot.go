@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -106,14 +105,6 @@ func Run() {
 	}
 
 	defer discord.Close()
-
-	// DEV DEBUG
-	ticker := time.NewTicker(3 * time.Second)
-	go func() {
-		for range ticker.C {
-			PrintMemUsage()
-		}
-	}()
 
 	// keep bot running untill there is NO os interruption (ctrl + C)
 	fmt.Println("Bot is running")
@@ -402,7 +393,14 @@ func handleCommandsChannel(ctx *Context) {
 		}
 
 		//lookup sound locally only, upload or bootup should assure it's either here or nowhere
-		searchTerm := strings.Split(uMsg.Content, " ")[1]
+		mSplit := strings.Split(uMsg.Content, " ")
+
+		if len(mSplit) != 2 {
+			// TODO: handle this properly and call .help
+			return
+		}
+
+		searchTerm := mSplit[1]
 		sound, ok := ctx.State.SoundList[searchTerm]
 		if !ok {
 			ctx.Session.ChannelMessageSend(ctx.ChannelID, "Sound not found")
@@ -963,13 +961,4 @@ func readyHandler(d *discordgo.Session, ready *discordgo.Ready) {
 			}
 		}
 	}
-}
-
-func PrintMemUsage() {
-	var m runtime.MemStats
-	runtime.ReadMemStats(&m)
-	fmt.Printf("Alloc = %v MiB", m.Alloc/1024/1024)
-	fmt.Printf("\tTotalAlloc = %v MiB", m.TotalAlloc/1024/1024)
-	fmt.Printf("\tSys = %v MiB", m.Sys/1024/1024)
-	fmt.Printf("\tNumGC = %v\n", m.NumGC)
 }
