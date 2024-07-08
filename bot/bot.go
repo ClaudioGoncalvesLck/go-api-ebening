@@ -215,6 +215,7 @@ func PlayAudioFile(v *discordgo.VoiceConnection, sound *Sound) {
 	opts := dca.StdEncodeOptions
 	opts.RawOutput = true
 	opts.Bitrate = 32
+	opts.CompressionLevel = 5
 
 	// use brain and redo this
 	if sound.Volume == 0 {
