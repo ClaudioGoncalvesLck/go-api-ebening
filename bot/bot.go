@@ -216,13 +216,15 @@ func messageHandler(d *discordgo.Session, userMsg *discordgo.MessageCreate) {
 
 // modified sample from github.com/jonas747/dca
 func PlayAudioFile(v *discordgo.VoiceConnection, sound *Sound) {
-	playbackMutex.Lock()
-	defer playbackMutex.Unlock()
+	// playbackMutex.Lock()
+	// defer playbackMutex.Unlock()
 
 	err := v.Speaking(true)
 	if err != nil {
 		log.Fatal("Failed setting speaking", err)
+		return
 	}
+	defer v.Speaking(false)
 
 	opts := dca.StdEncodeOptions
 	opts.RawOutput = true
@@ -236,37 +238,33 @@ func PlayAudioFile(v *discordgo.VoiceConnection, sound *Sound) {
 		opts.Volume = sound.Volume
 	}
 
-	encodeSession, err := dca.EncodeFile(sound.URL, opts)
+	session, err := dca.EncodeFile(sound.URL, dca.StdEncodeOptions)
+	defer session.Cleanup()
+
 	if err != nil {
-		log.Fatal("Failed creating an encoding session: ", err)
+		log.Println("Failed creating an encoding session:", err)
+		return
 	}
 
-	done := make(chan error)
-	stream := dca.NewStream(encodeSession, v, done)
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
 
-	for {
-		select {
-		case err := <-done:
-			if err == dca.ErrVoiceConnClosed {
-				encodeSession.Cleanup()
-			} else {
-				if err != nil && err != io.EOF {
-					log.Fatal("An error occurred", err)
-				}
-			}
-
-			v.Speaking(false)
-			encodeSession.Cleanup()
-			return
-		case <-stopPlayback:
-			// pause and wait to destroy
-			// if I don't, skipping kind of distorts the sound a bit
-			stream.SetPaused(true)
-			v.Speaking(false)
-			time.Sleep(150 * time.Millisecond)
-			encodeSession.Cleanup()
+	for range ticker.C {
+		frame, err := session.OpusFrame()
+		if v == nil || v.OpusSend == nil {
+			log.Println("Voice connection closed, stopping playback")
 			return
 		}
+
+		if err != nil {
+			if err.Error() == "EOF" {
+				return
+			}
+			log.Println("Error retrieving opus frame:", err)
+			return
+		}
+
+		v.OpusSend <- frame
 	}
 }
 
@@ -843,6 +841,10 @@ func voiceStateUpdate(d *discordgo.Session, v *discordgo.VoiceStateUpdate) {
 	ctx, err := getContext(d, nil, v)
 	if err != nil {
 		panic(err)
+	}
+
+	if v.Member.User.Bot {
+
 	}
 
 	if len(ctx.State.Channels.VoiceChannels) == 0 {
