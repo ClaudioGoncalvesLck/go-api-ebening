@@ -7,8 +7,8 @@ import (
 )
 
 func main() {
-	bot.BotToken = os.Getenv("BOT_TOKEN")
-	if bot.BotToken == "" {
+	bot.Token = os.Getenv("BOT_TOKEN")
+	if bot.Token == "" {
 		panic("BOT_TOKEN environment variable is required")
 	}
 	bot.Run()

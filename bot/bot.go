@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -20,26 +19,17 @@ import (
 	"github.com/jonas747/dca"
 )
 
-var BotToken string
-var store Store
+var Token string
+var store GlobalStore
 
 type Command string
 
-// [SoundName]
+// SoundList [SoundName]
 type SoundList map[string]*Sound
 
-// [UserID]
+// Entrances [UserID]
 type Entrances map[string]*Sound
 
-type Context struct {
-	GuildID         string                   `json:"guildId"`
-	UserID          string                   `json:"userId"`
-	ChannelID       string                   `json:"channelId"`
-	SoundsChannelID string                   `json:"soundsChannelId"`
-	State           *State                   `json:"state"`
-	Session         *discordgo.Session       `json:"-"`
-	UserMessage     *discordgo.MessageCreate `json:"-"`
-}
 type Sound struct {
 	MessageID string `json:"messageId"`
 	URL       string `json:"url"`
@@ -51,14 +41,15 @@ type Channels struct {
 	VoiceChannels []VoiceChannel `json:"voiceChannels"`
 }
 
-type State struct {
-	SoundList SoundList `json:"soundList"`
-	Entrances Entrances `json:"entrances"`
-	Channels  Channels  `json:"channels"`
+type GuildState struct {
+	SoundList       SoundList `json:"soundList"`
+	Entrances       Entrances `json:"entrances"`
+	Channels        Channels  `json:"channels"`
+	SoundsChannelID string    `json:"soundsChannelID"`
 }
 
-// [guildID]
-type Store map[string]State
+// Store [guildID]
+type GlobalStore map[string]GuildState
 
 type VoiceChannel struct {
 	ID             string
@@ -90,18 +81,7 @@ const (
 )
 
 func Run() {
-	log.SetFlags(log.LstdFlags | log.Llongfile)
-	lvl := new(slog.LevelVar)
-
-	ss := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
-		Level:     lvl,
-		AddSource: true,
-	}))
-	slog.SetDefault(ss)
-
-	lvl.Set(slog.LevelDebug)
-
-	discord, err := discordgo.New("Bot " + BotToken)
+	discord, err := discordgo.New("Bot " + Token)
 	if err != nil {
 		panic(err)
 	}
@@ -118,7 +98,7 @@ func Run() {
 
 	defer discord.Close()
 
-	// keep bot running untill there is NO os interruption (ctrl + C)
+	// keep bot running until there is NO os interruption (ctrl + C)
 	fmt.Println("Bot is running")
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt)
@@ -139,65 +119,9 @@ func Run() {
 //  when setting an entrance when use already has one, happened that the old one wasn't removed, can't reproduce
 //  profile mem with max load
 
-func getContext(d *discordgo.Session, userMsg *discordgo.MessageCreate, v *discordgo.VoiceStateUpdate) (*Context, error) {
-	var userID string
-	var channelID string
-	var guildID string
-
-	if userMsg != nil {
-		userID = userMsg.Author.ID
-		channelID = userMsg.ChannelID
-		guildID = userMsg.GuildID
-	} else {
-		userID = v.UserID
-		channelID = v.ChannelID
-		guildID = v.GuildID
-	}
-
-	guildState, ok := store[guildID]
-	if !ok {
-		return &Context{}, errors.New("guild context not initialized")
-	}
-
-	soundsChannelID, err := getSoundsChannelID(d, guildID)
-	if err != nil {
-		panic(err)
-	}
-
-	ctx := &Context{
-		UserID:          userID,
-		ChannelID:       channelID,
-		GuildID:         guildID,
-		State:           &guildState,
-		Session:         d,
-		UserMessage:     userMsg,
-		SoundsChannelID: soundsChannelID,
-	}
-
-	return ctx, nil
-}
-
 func messageHandler(d *discordgo.Session, userMsg *discordgo.MessageCreate) {
 	if userMsg.Author.Bot {
 		return
-	}
-
-	ctx, err := getContext(d, userMsg, nil)
-	if err != nil {
-		d.ChannelMessageSend(userMsg.ChannelID, "error getting context")
-	}
-
-	// for debugging, delete eventually
-	if userMsg.Content == ".reset" && userMsg.Author.ID == "123475794503794690" {
-		//delete all messages in channel
-		messages, err := ctx.Session.ChannelMessages(ctx.ChannelID, 100, "", "", "")
-		if err != nil {
-			log.Fatalf("Error getting messages: %v", err)
-		}
-
-		for _, message := range messages {
-			ctx.Session.ChannelMessageDelete(ctx.ChannelID, message.ID)
-		}
 	}
 
 	channel, err := d.Channel(userMsg.ChannelID)
@@ -206,22 +130,23 @@ func messageHandler(d *discordgo.Session, userMsg *discordgo.MessageCreate) {
 	}
 
 	if channel.Name == string(SoundsChannel) {
-		handleSoundsChannel(ctx)
+		handleSoundsChannel(d, userMsg)
 	}
 
 	if channel.Name == string(CommandsChannel) {
-		handleCommandsChannel(ctx)
+		handleCommandsChannel(d, userMsg)
 	}
 }
 
 // modified sample from github.com/jonas747/dca
-func PlayAudioFile(v *discordgo.VoiceConnection, sound *Sound) {
+func PlayAudioFile(d *discordgo.Session, uMsg *discordgo.MessageCreate, v *discordgo.VoiceConnection, sound *Sound) {
+	// this can't be here, playback should only by locked to 1 per server and voice channel, using it here blocks the whole bot
 	// playbackMutex.Lock()
 	// defer playbackMutex.Unlock()
 
 	err := v.Speaking(true)
 	if err != nil {
-		log.Fatal("Failed setting speaking", err)
+		log.Println("Failed setting speaking:", err)
 		return
 	}
 	defer v.Speaking(false)
@@ -249,22 +174,19 @@ func PlayAudioFile(v *discordgo.VoiceConnection, sound *Sound) {
 	ticker := time.NewTicker(20 * time.Millisecond)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		frame, err := session.OpusFrame()
-		if v == nil || v.OpusSend == nil {
-			log.Println("Voice connection closed, stopping playback")
+	for {
+		select {
+		case <-stopPlayback:
+			session.Cleanup()
 			return
-		}
-
-		if err != nil {
-			if err.Error() == "EOF" {
+		case <-ticker.C:
+			frame, err := session.OpusFrame()
+			if v == nil || v.OpusSend == nil || err != nil {
 				return
 			}
-			log.Println("Error retrieving opus frame:", err)
-			return
-		}
 
-		v.OpusSend <- frame
+			v.OpusSend <- frame
+		}
 	}
 }
 
@@ -314,35 +236,37 @@ func downloadFile(filepath string, url string) (err error) {
 	return nil
 }
 
-func handleSoundsChannel(ctx *Context) {
-	if len(ctx.UserMessage.Attachments) > 0 {
-		for _, attachment := range ctx.UserMessage.Attachments {
+func handleSoundsChannel(d *discordgo.Session, uMsg *discordgo.MessageCreate) {
+	if len(uMsg.Attachments) > 0 {
+		for _, attachment := range uMsg.Attachments {
 			if strings.Split(attachment.Filename, ".")[1] == "zip" {
-				handleZipUpload(ctx, attachment)
+				handleZipUpload(d, uMsg, attachment)
 			}
 
 			if strings.Split(attachment.Filename, ".")[1] == "mp3" {
-				ctx.State.SoundList[strings.TrimSuffix(attachment.Filename, ".mp3")] = &Sound{
-					MessageID: ctx.UserMessage.ID,
+				store[uMsg.Message.GuildID].SoundList[strings.TrimSuffix(attachment.Filename, ".mp3")] = &Sound{
+					MessageID: uMsg.ID,
 					URL:       attachment.URL,
 				}
 			}
 		}
 	} else {
-		m, err := ctx.Session.ChannelMessageSendReply(ctx.ChannelID, "Please use this channel for files only", ctx.UserMessage.Reference())
+		_, err := d.ChannelMessageSendReply(uMsg.Message.ChannelID, "Please use this channel for files only", uMsg.Reference())
 		if err != nil {
 			log.Fatalf("Error sending message: %v", err)
 		}
 		time.Sleep(3 * time.Second)
-		ctx.Session.ChannelMessageDelete(ctx.ChannelID, m.ID)
-		ctx.Session.ChannelMessageDelete(ctx.ChannelID, ctx.UserMessage.ID)
+		err = d.ChannelMessageDelete(uMsg.Message.ChannelID, uMsg.ID)
+		checkError(err)
+		err = d.ChannelMessageDelete(uMsg.Message.ChannelID, uMsg.ID)
+		checkError(err)
 	}
 }
 
-func handleCommandsChannel(ctx *Context) {
-	uMsg := ctx.UserMessage
+func handleCommandsChannel(d *discordgo.Session, uMsg *discordgo.MessageCreate) {
 	if len(uMsg.Attachments) > 0 {
-		ctx.Session.ChannelMessageSendReply(ctx.ChannelID, "If you're tring to upload a sound, put it in the 'sounds' channel", ctx.UserMessage.Reference())
+		_, err := d.ChannelMessageSendReply(uMsg.Message.ChannelID, "If you're trying to upload a sound, put it in the 'sounds' channel", uMsg.Reference())
+		checkError(err)
 	}
 
 	// skips the current sound only if the message is exactly ".ss" to avoid accidental skips
@@ -366,12 +290,13 @@ func handleCommandsChannel(ctx *Context) {
 				"`,adjustvol <sound-name> <volume>` Adjusts the volume of a sound (0-512).\n" +
 				"`,f <sound-name>` Finds a sound by name and returns a link to it."
 
-		ctx.Session.ChannelMessageSend(ctx.ChannelID, formattedMessage)
+		_, err := d.ChannelMessageSend(uMsg.Message.ChannelID, formattedMessage)
+		checkError(err)
 
 	case command == string(Connect):
-		v, err := tryConnectingToVoice(ctx.Session, ctx.GuildID, ctx.UserID, "")
+		v, err := tryConnectingToVoice(d, uMsg.Message.GuildID, uMsg.Author.ID, "")
 		if err != nil {
-			_, err := ctx.Session.ChannelMessageSend(ctx.ChannelID, "Error connecting to voice channel")
+			_, err := d.ChannelMessageSend(uMsg.Message.ChannelID, "Error connecting to voice channel")
 			if err != nil {
 				log.Fatalf("Error connecting to voice: Error sending message: %v", err)
 			}
@@ -379,27 +304,36 @@ func handleCommandsChannel(ctx *Context) {
 		}
 
 		if v == nil {
-			ctx.Session.ChannelMessageSendReply(ctx.ChannelID, "You need to be in a voice channel", uMsg.Reference())
+			_, err := d.ChannelMessageSendReply(uMsg.Message.ChannelID, "You need to be in a voice channel", uMsg.Reference())
+			checkError(err)
 			return
 		}
 
 	case command == string(PlaySound):
-		if len(ctx.State.SoundList) == 0 {
-			ctx.Session.ChannelMessageSend(ctx.ChannelID, "No sounds loaded")
+		if len(store[uMsg.Message.GuildID].SoundList) == 0 {
+			_, err := d.ChannelMessageSend(uMsg.Message.ChannelID, "No sounds loaded")
+			checkError(err)
 			return
 		}
 
-		voice, err := tryConnectingToVoice(ctx.Session, ctx.GuildID, ctx.UserID, "")
+		voiceState, err := d.State.VoiceState(uMsg.Message.GuildID, uMsg.Author.ID)
 		if err != nil {
-			_, err := ctx.Session.ChannelMessageSend(ctx.ChannelID, "Error connecting to voice channel")
-			if err != nil {
-				log.Fatalf("Error connecting to voice: Error sending message: %v", err)
-			}
+			_, err := d.ChannelMessageSend(uMsg.Message.ChannelID, "Error getting voice state")
+			checkError(err)
 			return
 		}
+
+		channelID := voiceState.ChannelID
+		voice, err := d.ChannelVoiceJoin(uMsg.Message.GuildID, channelID, false, false)
+		if err != nil {
+			panic(err)
+		}
+
+		fmt.Printf("Voice: %+v\n", voice)
 
 		if voice == nil {
-			ctx.Session.ChannelMessageSendReply(ctx.ChannelID, "You need to be in a voice channel", uMsg.Reference())
+			_, err := d.ChannelMessageSendReply(uMsg.Message.ChannelID, "You need to be in a voice channel", uMsg.Reference())
+			checkError(err)
 			return
 		}
 
@@ -412,19 +346,21 @@ func handleCommandsChannel(ctx *Context) {
 		}
 
 		searchTerm := mSplit[1]
-		sound, ok := ctx.State.SoundList[searchTerm]
+		sound, ok := store[uMsg.Message.GuildID].SoundList[searchTerm]
 		if !ok {
-			ctx.Session.ChannelMessageSend(ctx.ChannelID, "Sound not found")
+			_, err := d.ChannelMessageSend(uMsg.Message.ChannelID, "Sound not found")
+			checkError(err)
 			return
 		}
 
-		go PlayAudioFile(voice, sound)
+		go PlayAudioFile(d, uMsg, voice, sound)
 
 	case command == string(List):
 		// shoutout rasmussy
-		listOutput := "```(" + fmt.Sprint(len(ctx.State.SoundList)) + ") " + "Available sounds :\n------------------\n\n"
+		sList := store[uMsg.Message.GuildID].SoundList
+		listOutput := "```(" + fmt.Sprint(len(sList)) + ") " + "Available sounds :\n------------------\n\n"
 		nb := 0
-		for name := range ctx.State.SoundList {
+		for name := range sList {
 			nb += 1
 			var soundName = string(name)
 			for len(soundName) < 15 {
@@ -437,28 +373,32 @@ func handleCommandsChannel(ctx *Context) {
 			// Discord max message length is 2000
 			if len(listOutput) > 1950 { // removed condition for max sounds printed
 				listOutput += "```"
-				ctx.Session.ChannelMessageSend(ctx.ChannelID, listOutput)
+				_, err := d.ChannelMessageSend(uMsg.Message.ChannelID, listOutput)
+				checkError(err)
 				listOutput = "```"
 			}
 		}
 		listOutput += "```"
 		if listOutput != "``````" {
-			ctx.Session.ChannelMessageSend(ctx.ChannelID, listOutput)
+			_, err := d.ChannelMessageSend(uMsg.Message.ChannelID, listOutput)
+			checkError(err)
 		}
 
 	case command == string(Rename):
+		sList := store[uMsg.Message.GuildID].SoundList
 		// find file by name, upload it with new name, delete old file
 		searchTerm := strings.Split(uMsg.Content, " ")[1]
 		newName := strings.Split(uMsg.Content, " ")[2]
-		sound, ok := ctx.State.SoundList[searchTerm]
+		sound, ok := sList[searchTerm]
 		if !ok {
-			ctx.Session.ChannelMessageSend(ctx.ChannelID, "Sound not found")
+			_, err := d.ChannelMessageSend(uMsg.Message.ChannelID, "Sound not found")
+			checkError(err)
 			return
 		}
 
-		updatedMessage, updatedSound, err := reuploadSound(ctx, sound, searchTerm, newName)
+		updatedMessage, updatedSound, err := reuploadSound(d, uMsg, sound, searchTerm, newName)
 		if updatedMessage == nil || updatedSound == nil || err != nil {
-			_, err := ctx.Session.ChannelMessageSend(ctx.ChannelID, "Error reuploading sound")
+			_, err := d.ChannelMessageSend(uMsg.Message.ChannelID, "Error reuploading sound")
 			if err != nil {
 				panic(err)
 			}
@@ -467,23 +407,26 @@ func handleCommandsChannel(ctx *Context) {
 
 		// this is ugly af, check if there's a better way to do this
 		sound.MessageID = updatedMessage.ID
-		ctx.State.SoundList[newName] = updatedSound
-		delete(ctx.State.SoundList, searchTerm)
+		sList[newName] = updatedSound
+		delete(sList, searchTerm)
 
-		ctx.Session.ChannelMessageSendReply(ctx.ChannelID, "Sound renamed", uMsg.Reference())
+		_, err = d.ChannelMessageSendReply(uMsg.Message.ChannelID, "Sound renamed", uMsg.Reference())
+		checkError(err)
 
 	case command == string(AddEntrance):
+		sList := store[uMsg.Message.GuildID].SoundList
 		searchTerm := strings.Split(uMsg.Content, " ")[1]
 
-		sound, ok := ctx.State.SoundList[searchTerm]
+		sound, ok := sList[searchTerm]
 		if !ok {
-			ctx.Session.ChannelMessageSend(ctx.ChannelID, "Sound not found")
+			_, err := d.ChannelMessageSend(uMsg.Message.ChannelID, "Sound not found")
+			checkError(err)
 			return
 		}
 
-		soundMessage, err := ctx.Session.ChannelMessage(ctx.SoundsChannelID, sound.MessageID)
+		soundMessage, err := d.ChannelMessage(store[uMsg.Message.GuildID].SoundsChannelID, sound.MessageID)
 		if err != nil {
-			_, err := ctx.Session.ChannelMessageSend(ctx.ChannelID, "Error getting sound message")
+			_, err := d.ChannelMessageSend(uMsg.Message.ChannelID, "Error getting sound message")
 			if err != nil {
 				panic(err)
 			}
@@ -491,9 +434,9 @@ func handleCommandsChannel(ctx *Context) {
 		}
 
 		if !soundMessage.Author.Bot {
-			updatedMessage, updatedSound, err := reuploadSound(ctx, sound, searchTerm, "")
+			updatedMessage, updatedSound, err := reuploadSound(d, uMsg, sound, searchTerm, "")
 			if updatedMessage == nil || updatedSound == nil || err != nil {
-				_, err := ctx.Session.ChannelMessageSend(ctx.ChannelID, "Error reuploading sound")
+				_, err := d.ChannelMessageSend(uMsg.Message.ChannelID, "Error reuploading sound")
 				if err != nil {
 					panic(err)
 				}
@@ -501,21 +444,22 @@ func handleCommandsChannel(ctx *Context) {
 			}
 			soundMessage = updatedMessage
 			// updatedMessage here sometimes doesn't have GuildID??? idk why
-			ctx.State.SoundList[searchTerm] = updatedSound
+			store[uMsg.Message.GuildID].SoundList[searchTerm] = updatedSound
 			sound = updatedSound
 		}
 
-		userEntrance, ok := ctx.State.Entrances[ctx.UserID]
+		userEntrance, ok := store[uMsg.Message.GuildID].Entrances[uMsg.Author.ID]
 		if ok {
 			if userEntrance.MessageID == sound.MessageID {
-				ctx.Session.ChannelMessageSend(ctx.ChannelID, "This is already your entrance")
+				_, err := d.ChannelMessageSend(uMsg.Message.ChannelID, "This is already your entrance")
+				checkError(err)
 				return
 			} else {
-				delete(ctx.State.Entrances, ctx.UserID)
-				oldEntranceMessage, err := ctx.Session.ChannelMessage(ctx.SoundsChannelID, userEntrance.MessageID)
+				delete(store[uMsg.Message.GuildID].Entrances, uMsg.Author.ID)
+				oldEntranceMessage, err := d.ChannelMessage(store[uMsg.Message.GuildID].SoundsChannelID, userEntrance.MessageID)
 				if err != nil {
 					if strings.Contains(err.Error(), "HTTP 404") {
-						delete(ctx.State.Entrances, ctx.UserID)
+						delete(store[uMsg.Message.GuildID].Entrances, uMsg.Author.ID)
 					} else {
 						panic(err)
 					}
@@ -541,9 +485,9 @@ func handleCommandsChannel(ctx *Context) {
 					}
 
 					oldEntranceMessage.Content = updatedTags
-					_, err = ctx.Session.ChannelMessageEdit(ctx.SoundsChannelID, oldEntranceMessage.ID, oldEntranceMessage.Content)
+					_, err = d.ChannelMessageEdit(store[uMsg.Message.GuildID].SoundsChannelID, oldEntranceMessage.ID, oldEntranceMessage.Content)
 					if err != nil {
-						_, err := ctx.Session.ChannelMessageSend(ctx.ChannelID, "Error removing volume from old entrance")
+						_, err := d.ChannelMessageSend(uMsg.Message.ChannelID, "Error removing volume from old entrance")
 						if err != nil {
 							panic(err)
 						}
@@ -565,8 +509,9 @@ func handleCommandsChannel(ctx *Context) {
 				tagType, tagValue := typeValue[0], typeValue[1]
 
 				if tagType == "e" {
-					if tagValue == ctx.UserID {
-						ctx.Session.ChannelMessageSend(ctx.ChannelID, "This is already your entrance")
+					if tagValue == uMsg.Author.ID {
+						_, err := d.ChannelMessageSend(uMsg.Message.ChannelID, "This is already your entrance")
+						checkError(err)
 						return
 					}
 				}
@@ -574,51 +519,55 @@ func handleCommandsChannel(ctx *Context) {
 
 		}
 
-		soundMessage.Content += "e:" + ctx.UserID + ";"
-		ctx.Session.ChannelMessageEdit(ctx.SoundsChannelID, soundMessage.ID, soundMessage.Content)
-		ctx.State.Entrances[ctx.UserID] = sound
+		soundMessage.Content += "e:" + uMsg.Author.ID + ";"
+		_, err = d.ChannelMessageEdit(store[uMsg.Message.GuildID].SoundsChannelID, soundMessage.ID, soundMessage.Content)
+		checkError(err)
 
-		ctx.Session.ChannelMessageSendReply(ctx.ChannelID, "Entrance set", uMsg.Reference())
+		store[uMsg.Message.GuildID].Entrances[uMsg.Author.ID] = sound
+		_, err = d.ChannelMessageSendReply(uMsg.Message.ChannelID, "Entrance set", uMsg.Reference())
+		checkError(err)
 
 	case command == string(Adjustvol):
 		searchTerm := strings.Split(uMsg.Content, " ")[1]
 		volStr := strings.Split(uMsg.Content, " ")[2]
 		volInt, err := strconv.ParseInt(volStr, 10, 64)
 		if err != nil {
-			_, err := ctx.Session.ChannelMessageSend(ctx.ChannelID, "Volume must be between 1 and 512 (0-200%)")
+			_, err := d.ChannelMessageSend(uMsg.Message.ChannelID, "Volume must be between 1 and 512 (0-200%)")
 			if err != nil {
 				panic(err)
 			}
 		}
 
 		if volInt < 0 || volInt > 512 {
-			ctx.Session.ChannelMessageSend(ctx.ChannelID, "Volume must be between 1 and 512 (0-200%)")
+			_, err := d.ChannelMessageSend(uMsg.Message.ChannelID, "Volume must be between 1 and 512 (0-200%)")
+			checkError(err)
 			return
 		}
 
-		sound, ok := ctx.State.SoundList[searchTerm]
+		sound, ok := store[uMsg.Message.GuildID].SoundList[searchTerm]
 		if !ok {
-			ctx.Session.ChannelMessageSend(ctx.ChannelID, "Sound not found")
+			_, err := d.ChannelMessageSend(uMsg.Message.ChannelID, "Sound not found")
+			checkError(err)
 			return
 		}
 
-		soundMessage, err := ctx.Session.ChannelMessage(ctx.SoundsChannelID, sound.MessageID)
+		soundMessage, err := d.ChannelMessage(store[uMsg.Message.GuildID].SoundsChannelID, sound.MessageID)
 		if err != nil {
 			panic(err)
 		}
 
 		// make function for this
 		if !soundMessage.Author.Bot {
-			updatedMessage, updatedSound, err := reuploadSound(ctx, sound, searchTerm, "")
+			updatedMessage, updatedSound, err := reuploadSound(d, uMsg, sound, searchTerm, "")
 			if updatedMessage == nil || updatedSound == nil || err != nil {
-				_, err := ctx.Session.ChannelMessageSend(ctx.ChannelID, "Error reuploading sound")
+				_, err := d.ChannelMessageSend(uMsg.Message.ChannelID, "Error reuploading sound")
 				if err != nil {
 					panic(err)
 				}
 				return
 			}
 			soundMessage = updatedMessage
-			ctx.State.SoundList[searchTerm] = updatedSound
+			store[uMsg.Message.GuildID].SoundList[searchTerm] = updatedSound
 			sound = updatedSound
 		}
 
@@ -643,35 +592,37 @@ func handleCommandsChannel(ctx *Context) {
 
 		updatedTags += "v:" + volStr + ";"
 		soundMessage.Content = updatedTags
-		_, err = ctx.Session.ChannelMessageEdit(ctx.SoundsChannelID, soundMessage.ID, soundMessage.Content)
+		_, err = d.ChannelMessageEdit(store[uMsg.Message.GuildID].SoundsChannelID, soundMessage.ID, soundMessage.Content)
 		if err != nil {
 			panic(err)
 		}
-		ctx.State.SoundList[searchTerm].Volume = int(volInt)
-		ctx.Session.ChannelMessageSendReply(ctx.ChannelID, "Volume adjusted", uMsg.Reference())
-
+		store[uMsg.Message.GuildID].SoundList[searchTerm].Volume = int(volInt)
+		_, err = d.ChannelMessageSendReply(uMsg.Message.ChannelID, "Volume adjusted", uMsg.Reference())
+		checkError(err)
 	case command == string(Find):
 		searchTerm := strings.Split(uMsg.Content, " ")[1]
-		sound, ok := ctx.State.SoundList[searchTerm]
+		sound, ok := store[uMsg.Message.GuildID].SoundList[searchTerm]
 		if !ok {
-			ctx.Session.ChannelMessageSend(ctx.ChannelID, "Sound not found")
+			_, err := d.ChannelMessageSend(uMsg.Message.ChannelID, "Sound not found")
+			checkError(err)
 			return
 		}
 
-		messageLink := "https://discordapp.com/channels/" + ctx.GuildID + "/" + ctx.SoundsChannelID + "/" + sound.MessageID
+		messageLink := "https://discordapp.com/channels/" + uMsg.Message.GuildID + "/" + store[uMsg.Message.GuildID].SoundsChannelID + "/" + sound.MessageID
 		messageMarkdown := "Found this: [" + searchTerm + "](" + messageLink + ")"
-		ctx.Session.ChannelMessageSendReply(ctx.ChannelID, messageMarkdown, ctx.UserMessage.Reference())
+		_, err := d.ChannelMessageSendReply(uMsg.Message.ChannelID, messageMarkdown, uMsg.Reference())
+		checkError(err)
 	}
 }
 
 // // This is most likely not the best way to do this
 // // if message has a zip file, extract it and send every .mp3 file to the sounds channel
 // // delete the original message and the files written to disk
-func handleZipUpload(ctx *Context, attachment *discordgo.MessageAttachment) {
+func handleZipUpload(d *discordgo.Session, uMsg *discordgo.MessageCreate, attachment *discordgo.MessageAttachment) {
 	err := os.Mkdir("sounds", 0755)
 	if err != nil {
 		if !os.IsExist(err) {
-			_, err := ctx.Session.ChannelMessageSend(ctx.ChannelID, "Error handling zip upload")
+			_, err := d.ChannelMessageSend(uMsg.Message.ChannelID, "Error handling zip upload")
 			if err != nil {
 				panic(err)
 			}
@@ -680,7 +631,8 @@ func handleZipUpload(ctx *Context, attachment *discordgo.MessageAttachment) {
 	}
 
 	filePath := filepath.Join("sounds", attachment.Filename)
-	downloadFile(attachment.Filename, attachment.URL)
+	err = downloadFile(attachment.Filename, attachment.URL)
+	checkError(err)
 
 	archive, err := zip.OpenReader(filePath)
 	if err != nil {
@@ -701,7 +653,7 @@ func handleZipUpload(ctx *Context, attachment *discordgo.MessageAttachment) {
 				panic(err)
 			}
 
-			_, err = ctx.Session.ChannelFileSend(ctx.ChannelID, file.Name, fileReader)
+			_, err = d.ChannelFileSend(uMsg.Message.ChannelID, file.Name, fileReader)
 			if err != nil {
 				panic(err)
 			}
@@ -712,19 +664,17 @@ func handleZipUpload(ctx *Context, attachment *discordgo.MessageAttachment) {
 	}
 
 	err = os.RemoveAll("sounds")
-	if err != nil {
-		panic(err)
-	}
-	ctx.Session.ChannelMessageDelete(ctx.ChannelID, ctx.UserMessage.ID)
+	checkError(err)
+
+	err = d.ChannelMessageDelete(uMsg.Message.ChannelID, uMsg.ID)
+	checkError(err)
 }
 
 // discord rate limit's at around 4/5 quick requests and this does 1 per 100 sounds (4 at the current 390 sounds)
 // loads sounds and entrances to memory
 func getSoundsRecursive(d *discordgo.Session, guildID string, beforeID string) error {
 	soundsChannelID, err := getSoundsChannelID(d, guildID)
-	if err != err {
-		panic(err)
-	}
+	checkError(err)
 	channelMessages, err := d.ChannelMessages(soundsChannelID, 100, beforeID, "", "")
 	if err != nil {
 		return err
@@ -798,8 +748,8 @@ func getSoundsChannelID(d *discordgo.Session, guildID string) (string, error) {
 	return "", errors.New("no 'sounds' channel found")
 }
 
-func getUsersInVC(ctx *Context) {
-	currentGuild, err := ctx.Session.State.Guild(ctx.GuildID)
+func getUsersInVC(d *discordgo.Session, uMsg *discordgo.MessageCreate) {
+	currentGuild, err := d.State.Guild(uMsg.Message.GuildID)
 	if err != nil {
 		panic(err)
 	}
@@ -809,7 +759,7 @@ func getUsersInVC(ctx *Context) {
 		if channel.Type == discordgo.ChannelTypeGuildVoice {
 			voiceChannelsMap[channel.ID] = &VoiceChannel{
 				ID:             channel.ID,
-				GuildID:        ctx.GuildID,
+				GuildID:        uMsg.Message.GuildID,
 				Name:           channel.Name,
 				UsersConnected: []discordgo.User{},
 			}
@@ -818,7 +768,7 @@ func getUsersInVC(ctx *Context) {
 
 	for _, vs := range currentGuild.VoiceStates {
 		if vc, ok := voiceChannelsMap[vs.ChannelID]; ok {
-			user, err := ctx.Session.User(vs.UserID)
+			user, err := d.User(vs.UserID)
 			if err != nil {
 				fmt.Println("Error getting user:", err)
 				continue
@@ -834,76 +784,81 @@ func getUsersInVC(ctx *Context) {
 		Channels.VoiceChannels = append(Channels.VoiceChannels, *vc)
 	}
 
-	ctx.State.Channels = Channels
+	// check if I actually have to do this
+	guildState := store[uMsg.Message.GuildID]
+	guildState.Channels = Channels
+	store[uMsg.Message.GuildID] = guildState
 }
 
 func voiceStateUpdate(d *discordgo.Session, v *discordgo.VoiceStateUpdate) {
-	ctx, err := getContext(d, nil, v)
-	if err != nil {
-		panic(err)
-	}
+	// if v.Member.User.Bot {
+	// 	// check if bot left voice channel
+	// 	if v.BeforeUpdate != nil && v.BeforeUpdate.ChannelID != "" {
+	// 		if v.ChannelID == "" { // bot left voice channel
+	// 			stopPlayback <- true
+	// 		}
+	// 		// voiceChannelStateUpdate(ctx)
+	// 	}
+	// 	return
+	// }
 
-	if v.Member.User.Bot {
+	// if len(store[uMsg.Message.GuildID].Channels.VoiceChannels) == 0 {
+	// 	getUsersInVC(d, uMsg)
+	// }
 
-	}
+	// voiceChannelStateUpdate(d, uMsg)
+	// // plays entrance if user joins a voice channel, doesn't on switch
+	// if v.ChannelID != "" && v.BeforeUpdate == nil {
+	// 	userEntrance, ok := store[uMsg.Message.GuildID].Entrances[uMsg.Author.ID]
+	// 	if ok {
+	// 		voice, err := tryConnectingToVoice(d, v.GuildID, v.UserID, v.ChannelID)
+	// 		if err != nil {
+	// 			panic(err)
+	// 		}
 
-	if len(ctx.State.Channels.VoiceChannels) == 0 {
-		getUsersInVC(ctx)
-	}
+	// 		if voice == nil {
+	// 			return
+	// 		}
 
-	voiceChannelStateUpdate(ctx)
-	// plays entrance if user joins a voice channel, doesn't on switch
-	if v.ChannelID != "" && v.BeforeUpdate == nil {
-		userEntrance, ok := ctx.State.Entrances[ctx.UserID]
-		if ok {
-			voice, err := tryConnectingToVoice(d, v.GuildID, v.UserID, v.ChannelID)
-			if err != nil {
-				panic(err)
-			}
-
-			if voice == nil {
-				return
-			}
-
-			go PlayAudioFile(voice, userEntrance)
-		}
-	}
+	// 		go PlayAudioFile(d, uMsg, voice, userEntrance)
+	// 	}
+	// }
 }
 
-func voiceChannelStateUpdate(ctx *Context) {
+func voiceChannelStateUpdate(d *discordgo.Session, uMsg *discordgo.MessageCreate) {
 loop:
-	for idx, vc := range ctx.State.Channels.VoiceChannels {
+	for idx, vc := range store[uMsg.Message.GuildID].Channels.VoiceChannels {
 		for i, user := range vc.UsersConnected {
-			if user.ID == ctx.UserID {
-				ctx.State.Channels.VoiceChannels[idx].UsersConnected = append(vc.UsersConnected[:i], vc.UsersConnected[i+1:]...)
+			if user.ID == uMsg.Author.ID {
+				store[uMsg.Message.GuildID].Channels.VoiceChannels[idx].UsersConnected = append(vc.UsersConnected[:i], vc.UsersConnected[i+1:]...)
 				break loop
 			}
 		}
 	}
 
-	if ctx.ChannelID != "" {
-		for idx, vc := range ctx.State.Channels.VoiceChannels {
-			if vc.ID == ctx.ChannelID {
-				user, err := ctx.Session.User(ctx.UserID)
+	if uMsg.Message.ChannelID != "" {
+		for idx, vc := range store[uMsg.Message.GuildID].Channels.VoiceChannels {
+			if vc.ID == uMsg.Message.ChannelID {
+				user, err := d.User(uMsg.Author.ID)
 				if err != nil {
 					fmt.Println("Error getting user:", err)
 					return
 				}
-				ctx.State.Channels.VoiceChannels[idx].UsersConnected = append(vc.UsersConnected, *user)
+				store[uMsg.Message.GuildID].Channels.VoiceChannels[idx].UsersConnected = append(vc.UsersConnected, *user)
 				return
 			}
 		}
 	}
 }
 
-func reuploadSound(ctx *Context, sound *Sound, searchTerm string, fileName string) (*discordgo.Message, *Sound, error) {
+func reuploadSound(d *discordgo.Session, uMsg *discordgo.MessageCreate, sound *Sound, searchTerm string, fileName string) (*discordgo.Message, *Sound, error) {
 	req, err := http.Get(sound.URL)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer req.Body.Close()
 
-	oldMessage, err := ctx.Session.ChannelMessage(ctx.SoundsChannelID, sound.MessageID)
+	oldMessage, err := d.ChannelMessage(store[uMsg.Message.GuildID].SoundsChannelID, sound.MessageID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -918,7 +873,7 @@ func reuploadSound(ctx *Context, sound *Sound, searchTerm string, fileName strin
 			tagType, tagValue := typeValue[0], typeValue[1]
 
 			if tagType == "e" {
-				ctx.State.Entrances[tagValue] = sound
+				store[uMsg.Message.GuildID].Entrances[tagValue] = sound
 			}
 		}
 	}
@@ -926,7 +881,7 @@ func reuploadSound(ctx *Context, sound *Sound, searchTerm string, fileName strin
 	if fileName == "" {
 		fileName = searchTerm
 	}
-	soundMessage, err := ctx.Session.ChannelMessageSendComplex(ctx.SoundsChannelID, &discordgo.MessageSend{
+	soundMessage, err := d.ChannelMessageSendComplex(store[uMsg.Message.GuildID].SoundsChannelID, &discordgo.MessageSend{
 		Content: oldMessage.Content,
 		Files: []*discordgo.File{
 			{
@@ -939,7 +894,7 @@ func reuploadSound(ctx *Context, sound *Sound, searchTerm string, fileName strin
 		return nil, nil, err
 	}
 
-	err = ctx.Session.ChannelMessageDelete(ctx.SoundsChannelID, sound.MessageID)
+	err = d.ChannelMessageDelete(store[uMsg.Message.GuildID].SoundsChannelID, sound.MessageID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -956,24 +911,36 @@ func reuploadSound(ctx *Context, sound *Sound, searchTerm string, fileName strin
 func readyHandler(d *discordgo.Session, ready *discordgo.Ready) {
 	for _, guild := range ready.Guilds {
 		if store == nil {
-			store = make(Store)
+			store = make(GlobalStore)
 		}
 
-		store[guild.ID] = State{
-			SoundList: make(SoundList),
-			Entrances: make(Entrances),
+		soundsChannelID, err := getSoundsChannelID(d, guild.ID)
+		if err != nil {
+			panic(err)
+		}
+
+		store[guild.ID] = GuildState{
+			SoundList:       make(SoundList),
+			Entrances:       make(Entrances),
+			SoundsChannelID: soundsChannelID,
 			Channels: Channels{
 				VoiceChannels: []VoiceChannel{},
 			},
 		}
 
-		// try using ctx here
-		err := getSoundsRecursive(d, guild.ID, "")
+		err = getSoundsRecursive(d, guild.ID, "")
 		if err != nil {
 			_, err := d.ChannelMessageSend(guild.ID, "Error loading sounds")
 			if err != nil {
 				panic(err)
 			}
 		}
+	}
+}
+
+// this is temporary, i'll make it work first then clean all this up
+func checkError(err error) {
+	if err != nil {
+		panic(err)
 	}
 }
