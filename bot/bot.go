@@ -16,7 +16,7 @@ import (
 	"time"
 
 	"github.com/bwmarrin/discordgo"
-	"github.com/cgoncalveslck/dcalck"
+	dca "github.com/cgoncalveslck/dcalck"
 )
 
 var storeRebuilds int
@@ -49,6 +49,7 @@ type GuildState struct {
 	Channels        Channels  `json:"channels"`
 	SoundsChannelID string    `json:"soundsChannelID"`
 	Mutex           sync.Mutex
+	StopPlayback    chan bool
 }
 
 // GlobalStore Store [guildID]
@@ -60,10 +61,6 @@ type VoiceChannel struct {
 	Name           string
 	UsersConnected []discordgo.User
 }
-
-var (
-	stopPlayback = make(chan bool)
-)
 
 const (
 	SoundsChannel   string = "sounds"
@@ -143,6 +140,13 @@ func PlayAudioFile(d *discordgo.Session, guildID string, v *discordgo.VoiceConne
 	store[guildID].Mutex.Lock()
 	defer store[guildID].Mutex.Unlock()
 
+	select {
+    case <-store[guildID].StopPlayback:
+        fmt.Printf("Cleared existing stop signal for guild %s\n", guildID)
+    default:
+        fmt.Printf("No existing stop signal for guild %s\n", guildID)
+    }
+
 	opts := dca.StdEncodeOptions
 	opts.RawOutput = true
 	opts.Bitrate = 32
@@ -190,7 +194,7 @@ func PlayAudioFile(d *discordgo.Session, guildID string, v *discordgo.VoiceConne
 
 	for {
 		select {
-		case <-stopPlayback:
+		case <-store[guildID].StopPlayback:
 			fmt.Println("Stopping playback")
 			return
 		case <-ticker.C:
@@ -222,7 +226,16 @@ func handleCommandsChannel(d *discordgo.Session, uMsg *discordgo.MessageCreate) 
 
 	// skips the current sound only if the message is exactly ".ss" to avoid accidental skips
 	if uMsg.Content == string(SkipSound) {
-		stopPlayback <- true
+		if store[uMsg.GuildID].StopPlayback != nil {
+			select {
+			case store[uMsg.GuildID].StopPlayback <- true:
+				fmt.Println("Stop signal sent")
+			default:
+				fmt.Println("Channel is full or closed")
+			}
+		} else {
+			fmt.Println("StopPlayback channel is nil")
+		}
 		return
 	}
 
@@ -688,6 +701,7 @@ func buildStore(d *discordgo.Session, ready *discordgo.Ready) {
 			Channels: Channels{
 				VoiceChannels: []VoiceChannel{},
 			},
+			StopPlayback:    make(chan bool, 1),
 		}
 	}
 
@@ -751,7 +765,7 @@ func voiceStateUpdate(d *discordgo.Session, v *discordgo.VoiceStateUpdate) {
 		// check if bot left voice channel
 		if v.BeforeUpdate != nil && v.BeforeUpdate.ChannelID != "" {
 			if v.ChannelID == "" { // bot left voice channel
-				stopPlayback <- true
+				store[v.GuildID].StopPlayback <- true
 			}
 			voiceChannelStateUpdate(d, v)
 		}
