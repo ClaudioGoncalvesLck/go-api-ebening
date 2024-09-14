@@ -113,7 +113,7 @@ func Run() {
 // 	check if sound exists on upload
 // 	order .list
 //  profile mem with max load
-// 	entrances stack if user leaves/rejoins and bot is playing (shouln't happen but for future reference)
+// 	entrances stack if user leaves/rejoins and bot is playing (shouldn't happen but for future reference)
 
 func messageHandler(d *discordgo.Session, userMsg *discordgo.MessageCreate) {
 	if userMsg.Author.Bot {
@@ -129,7 +129,7 @@ func messageHandler(d *discordgo.Session, userMsg *discordgo.MessageCreate) {
 		handleCommandsChannel(d, userMsg)
 	}
 
-	if channel.Name == string(SoundsChannel) {
+	if channel.Name == SoundsChannel {
 		handleSoundsChannel(d, userMsg)
 	}
 
@@ -141,11 +141,11 @@ func PlayAudioFile(d *discordgo.Session, guildID string, v *discordgo.VoiceConne
 	defer store[guildID].Mutex.Unlock()
 
 	select {
-    case <-store[guildID].StopPlayback:
-        fmt.Printf("Cleared existing stop signal for guild %s\n", guildID)
-    default:
-        fmt.Printf("No existing stop signal for guild %s\n", guildID)
-    }
+	case <-store[guildID].StopPlayback:
+		fmt.Printf("Cleared existing stop signal for guild %s\n", guildID)
+	default:
+		fmt.Printf("No existing stop signal for guild %s\n", guildID)
+	}
 
 	opts := dca.StdEncodeOptions
 	opts.RawOutput = true
@@ -195,7 +195,7 @@ func PlayAudioFile(d *discordgo.Session, guildID string, v *discordgo.VoiceConne
 	for {
 		select {
 		case <-store[guildID].StopPlayback:
-			fmt.Println("Stopping playback")
+			time.Sleep(100 * time.Millisecond)
 			return
 		case <-ticker.C:
 			frame, err := session.OpusFrame()
@@ -224,23 +224,10 @@ func handleCommandsChannel(d *discordgo.Session, uMsg *discordgo.MessageCreate) 
 		return
 	}
 
-	// skips the current sound only if the message is exactly ".ss" to avoid accidental skips
-	if uMsg.Content == string(SkipSound) {
-		if store[uMsg.GuildID].StopPlayback != nil {
-			select {
-			case store[uMsg.GuildID].StopPlayback <- true:
-				fmt.Println("Stop signal sent")
-			default:
-				fmt.Println("Channel is full or closed")
-			}
-		} else {
-			fmt.Println("StopPlayback channel is nil")
-		}
-		return
-	}
-
 	command := strings.Split(uMsg.Content, " ")[0]
 	switch {
+	case command == string(SkipSound):
+		handleSkipSound(d, uMsg)
 	case command == string(Help):
 		formattedMessage :=
 			"### To add sounds, just send them to the 'sounds' channel as a message (just the file, no text)\n" +
@@ -249,6 +236,7 @@ func handleCommandsChannel(d *discordgo.Session, uMsg *discordgo.MessageCreate) 
 				"`,connect` Connects to the voice channel you are in.\n" +
 				"`,list` Lists all sounds in the sounds channel.\n" +
 				"`,ss` Stops the current sound.\n" +
+				"`,ss <sound-name>` Skips current sound and plays new one.\n" +
 				"`,rename <current-name> <new-name>` Renames a sound.\n" +
 				"`,addentrance <sound-name>` Sets a sound as your entrance sound.\n" +
 				"`,adjustvol <sound-name> <volume>` Adjusts the volume of a sound (0-512).\n" +
@@ -669,18 +657,46 @@ func readyHandler(d *discordgo.Session, ready *discordgo.Ready) {
 	buildStore(d, ready)
 	fmt.Println("Store initialized")
 
-	// maintain store: discord expires links after a while, 4 for debugging, increase this later
 	go maintainStore(d, ready)
 }
 
+func handleSkipSound(d *discordgo.Session, uMsg *discordgo.MessageCreate) {
+	if store[uMsg.GuildID].StopPlayback != nil {
+		select {
+		case store[uMsg.GuildID].StopPlayback <- true:
+			fmt.Println("Stopping playback")
+		default:
+			fmt.Println("Channel is full or closed")
+		}
+	}
+
+	time.Sleep(500 * time.Millisecond)
+	if len(strings.Split(uMsg.Content, " ")) > 1 {
+		searchTerm := strings.Split(uMsg.Content, " ")[1]
+		sound, ok := store[uMsg.Message.GuildID].SoundList[searchTerm]
+		if !ok {
+			_, err := d.ChannelMessageSend(uMsg.Message.ChannelID, "Sound not found")
+			checkError(err)
+			return
+		}
+
+		voiceState, err := d.State.VoiceState(uMsg.Message.GuildID, uMsg.Author.ID)
+		if err != nil {
+			_, err := d.ChannelMessageSend(uMsg.Message.ChannelID, "Error getting voice state")
+			checkError(err)
+			return
+		}
+
+		voice, err := d.ChannelVoiceJoin(uMsg.Message.GuildID, voiceState.ChannelID, false, false)
+		go PlayAudioFile(d, uMsg.GuildID, voice, sound)
+	}
+
+}
+
 func maintainStore(d *discordgo.Session, ready *discordgo.Ready) {
-	fmt.Println("Setting up store maintenance")
 	rebuildTicker := time.NewTicker(4 * time.Hour)
 	for range rebuildTicker.C {
-		fmt.Printf("Rebuilding store at %v\n", time.Now())
 		storeRebuilds++
-		fmt.Println("Store rebuilds: ", storeRebuilds)
-
 		buildStore(d, ready)
 	}
 }
@@ -701,7 +717,7 @@ func buildStore(d *discordgo.Session, ready *discordgo.Ready) {
 			Channels: Channels{
 				VoiceChannels: []VoiceChannel{},
 			},
-			StopPlayback:    make(chan bool, 1),
+			StopPlayback: make(chan bool, 1),
 		}
 	}
 
@@ -762,11 +778,7 @@ func getUsersInVC(d *discordgo.Session, guildID string) {
 
 func voiceStateUpdate(d *discordgo.Session, v *discordgo.VoiceStateUpdate) {
 	if v.Member.User.Bot {
-		// check if bot left voice channel
 		if v.BeforeUpdate != nil && v.BeforeUpdate.ChannelID != "" {
-			if v.ChannelID == "" { // bot left voice channel
-				store[v.GuildID].StopPlayback <- true
-			}
 			voiceChannelStateUpdate(d, v)
 		}
 		return
@@ -790,6 +802,8 @@ func voiceStateUpdate(d *discordgo.Session, v *discordgo.VoiceStateUpdate) {
 				return
 			}
 
+			// wait a sec for discord channel join sound etc
+			time.Sleep(1 * time.Second)
 			go PlayAudioFile(d, v.GuildID, voice, userEntrance)
 		}
 	}
