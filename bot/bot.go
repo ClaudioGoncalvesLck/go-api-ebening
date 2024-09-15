@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -538,13 +539,19 @@ func handleCommandsChannel(d *discordgo.Session, uMsg *discordgo.MessageCreate) 
 		}
 
 		go PlayAudioFile(d, uMsg.GuildID, voice, sound)
-
+		
 	case command == string(List):
 		// shoutout rasmussy
 		sList := store[uMsg.Message.GuildID].SoundList
+		soundNames := make([]string, 0, len(sList))
+		for name := range sList {
+			soundNames = append(soundNames, name)
+		}
+		sort.Strings(soundNames)
+
 		listOutput := "```(" + fmt.Sprint(len(sList)) + ") " + "Available sounds :\n------------------\n\n"
 		nb := 0
-		for name := range sList {
+		for _, name := range soundNames {
 			nb += 1
 			var soundName = name
 			for len(soundName) < 15 {
@@ -567,7 +574,6 @@ func handleCommandsChannel(d *discordgo.Session, uMsg *discordgo.MessageCreate) 
 			_, err := d.ChannelMessageSend(uMsg.Message.ChannelID, listOutput)
 			checkError(err)
 		}
-
 	}
 }
 
