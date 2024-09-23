@@ -539,7 +539,7 @@ func handleCommandsChannel(d *discordgo.Session, uMsg *discordgo.MessageCreate) 
 		}
 
 		go PlayAudioFile(d, uMsg.GuildID, voice, sound)
-		
+
 	case command == string(List):
 		// shoutout rasmussy
 		sList := store[uMsg.Message.GuildID].SoundList
@@ -641,7 +641,6 @@ func getSoundsRecursive(d *discordgo.Session, guildID string, beforeID string) e
 }
 
 func getSoundsChannelID(d *discordgo.Session, guildID string) (string, error) {
-	// try using ctx here
 	channels, err := d.GuildChannels(guildID)
 	if err != nil {
 		return "", err
@@ -659,7 +658,6 @@ func getSoundsChannelID(d *discordgo.Session, guildID string) (string, error) {
 func readyHandler(d *discordgo.Session, ready *discordgo.Ready) {
 	fmt.Println("Bot is ready")
 
-	// build store
 	buildStore(d, ready)
 	fmt.Println("Store initialized")
 
@@ -939,14 +937,14 @@ func handleSoundsChannel(d *discordgo.Session, uMsg *discordgo.MessageCreate) {
 			}
 		}
 	} else {
-		_, err := d.ChannelMessageSendReply(uMsg.Message.ChannelID, "Please use this channel for files only", uMsg.Reference())
+		warningMsg, err := d.ChannelMessageSendReply(uMsg.Message.ChannelID, "Please use this channel for files only", uMsg.Reference())
 		if err != nil {
 			log.Fatalf("Error sending message: %v", err)
 		}
 		time.Sleep(3 * time.Second)
 		err = d.ChannelMessageDelete(uMsg.Message.ChannelID, uMsg.ID)
 		checkError(err)
-		err = d.ChannelMessageDelete(uMsg.Message.ChannelID, uMsg.ID)
+		err = d.ChannelMessageDelete(uMsg.Message.ChannelID, warningMsg.ID)
 		checkError(err)
 	}
 }
@@ -977,26 +975,34 @@ func handleZipUpload(d *discordgo.Session, uMsg *discordgo.MessageCreate, attach
 	defer archive.Close()
 
 	for _, file := range archive.File {
-		if strings.Split(file.Name, ".")[1] == "mp3" {
-			fileReader, err := file.Open()
-			if err != nil {
-				panic(err)
-			}
-
-			filePath := "sounds/" + file.Name
-			fileWriter, err := os.Create(filePath)
-			if err != nil {
-				panic(err)
-			}
-
-			_, err = d.ChannelFileSend(uMsg.Message.ChannelID, file.Name, fileReader)
-			if err != nil {
-				panic(err)
-			}
-
-			fileWriter.Close()
-			fileReader.Close()
+		if strings.Split(file.Name, ".")[1] != "mp3" {
+			return
 		}
+
+		fileReader, err := file.Open()
+		if err != nil {
+			panic(err)
+		}
+
+		filePath := "sounds/" + file.Name
+		fileWriter, err := os.Create(filePath)
+		if err != nil {
+			panic(err)
+		}
+
+		_, err = d.ChannelFileSend(uMsg.Message.ChannelID, file.Name, fileReader)
+		if err != nil {
+			panic(err)
+		}
+
+		soundName := strings.TrimSuffix(file.Name, ".mp3")
+		store[uMsg.GuildID].SoundList[soundName] = &Sound{
+			MessageID: uMsg.ID,
+			URL:       uMsg.Attachments[0].URL,
+		}
+
+		fileReader.Close()
+		fileWriter.Close()
 	}
 
 	err = os.RemoveAll("sounds")
