@@ -2,6 +2,7 @@ package bot
 
 import (
 	"archive/zip"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -19,8 +20,6 @@ import (
 	"github.com/bwmarrin/discordgo"
 	dca "github.com/cgoncalveslck/dcalck"
 )
-
-var storeRebuilds int
 
 var Token string
 var store GlobalStore
@@ -45,12 +44,12 @@ type Channels struct {
 }
 
 type GuildState struct {
-	SoundList       SoundList `json:"soundList"`
-	Entrances       Entrances `json:"entrances"`
-	Channels        Channels  `json:"channels"`
-	SoundsChannelID string    `json:"soundsChannelID"`
-	Mutex           sync.Mutex
-	StopPlayback    chan bool
+	SoundList       SoundList  `json:"soundList"`
+	Entrances       Entrances  `json:"entrances"`
+	Channels        Channels   `json:"channels"`
+	SoundsChannelID string     `json:"soundsChannelID"`
+	Mutex           sync.Mutex `json:"-"`
+	StopPlayback    chan bool  `json:"-"`
 }
 
 // GlobalStore Store [guildID]
@@ -94,6 +93,21 @@ func Run() {
 	if err != nil {
 		panic(err)
 	}
+
+	// Expose store
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// http://localhost:8080/?guildID=
+		gID := r.URL.Query().Get("guildID")
+		gState, ok := store[gID]
+		if ok {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(&gState)
+			return
+		}
+		http.Error(w, "Guild not found", http.StatusNotFound)
+	})
+
+	http.ListenAndServe(":8080", nil)
 
 	// keep bot running until there is NO os interruption (ctrl + C)
 	fmt.Println("Bot is running")
@@ -691,7 +705,7 @@ func handleSkipSound(d *discordgo.Session, uMsg *discordgo.MessageCreate) {
 			return
 		}
 
-		voice, err := d.ChannelVoiceJoin(uMsg.Message.GuildID, voiceState.ChannelID, false, false)
+		voice, _ := d.ChannelVoiceJoin(uMsg.Message.GuildID, voiceState.ChannelID, false, false)
 		go PlayAudioFile(d, uMsg.GuildID, voice, sound)
 	}
 
@@ -700,7 +714,6 @@ func handleSkipSound(d *discordgo.Session, uMsg *discordgo.MessageCreate) {
 func maintainStore(d *discordgo.Session, ready *discordgo.Ready) {
 	rebuildTicker := time.NewTicker(4 * time.Hour)
 	for range rebuildTicker.C {
-		storeRebuilds++
 		buildStore(d, ready)
 	}
 }
