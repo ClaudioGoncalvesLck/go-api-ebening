@@ -95,18 +95,7 @@ func Run() {
 	}
 
 	// Expose store
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		// http://localhost:8080/?guildID=
-		gID := r.URL.Query().Get("guildID")
-		gState, ok := store[gID]
-		if ok {
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(&gState)
-			return
-		}
-		http.Error(w, "Guild not found", http.StatusNotFound)
-	})
-
+	http.HandleFunc("/", handleSoundList)
 	http.ListenAndServe(":8080", nil)
 
 	// keep bot running until there is NO os interruption (ctrl + C)
@@ -114,6 +103,31 @@ func Run() {
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt)
 	<-c
+}
+
+func enableCors(w *http.ResponseWriter) {
+	(*w).Header().Set("Access-Control-Allow-Origin", "https://gleaming-exploration-production.up.railway.app")
+	(*w).Header().Set("Access-Control-Allow-Credentials", "true")
+	(*w).Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+	(*w).Header().Set("Access-Control-Allow-Headers", "Accept, Content-Type, Content-Length, Accept-Encoding, Authorization")
+}
+
+func handleSoundList(w http.ResponseWriter, r *http.Request) {
+	enableCors(&w)
+
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	gID := r.URL.Query().Get("guildID")
+	gState, ok := store[gID]
+	if ok {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(&gState)
+		return
+	}
+	http.Error(w, "Guild not found", http.StatusNotFound)
 }
 
 // TODO:
